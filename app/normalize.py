@@ -11,10 +11,22 @@ def raw_hash(messages) -> str:
 _WS = re.compile(r"\s+")
 
 
+def _user_text(messages) -> str:
+    return " ".join(m["content"] for m in messages if m["role"] == "user")
+
+
 def normalize(messages) -> str:
     """Embedding input ONLY. Lossy on purpose; never used as an exact key."""
-    user = " ".join(m["content"] for m in messages if m["role"] == "user")
-    return _WS.sub(" ", user.lower()).strip()
+    return _WS.sub(" ", _user_text(messages).lower()).strip()
+
+
+def constraint_input(messages) -> str:
+    """Constraint-extraction input — case preserved, unlike normalize().
+    app/constraints.py's entities dimension depends on capitalization to
+    find proper nouns; feeding it normalize()'s lowercased output would
+    silently zero out entity detection entirely, not just degrade it.
+    """
+    return _user_text(messages)
 
 
 def params_hash(messages, temperature: float, max_tokens: int, model: str) -> str:

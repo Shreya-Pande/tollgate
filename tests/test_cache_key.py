@@ -20,8 +20,8 @@ def test_normalize_collapses_whitespace_and_lowercases():
 
 def test_different_temperature_produces_different_params_hash():
     messages = [{"role": "user", "content": "what is a b-tree"}]
-    h1 = params_hash(messages, temperature=0.0, max_tokens=1024, model="gemini-flash-latest")
-    h2 = params_hash(messages, temperature=1.0, max_tokens=1024, model="gemini-flash-latest")
+    h1 = params_hash(messages, temperature=0.0, max_tokens=1024, model="gemini-3.5-flash-lite")
+    h2 = params_hash(messages, temperature=1.0, max_tokens=1024, model="gemini-3.5-flash-lite")
     assert h1 != h2
 
 
@@ -36,9 +36,9 @@ def test_different_tenants_same_prompt_have_different_cache_keys():
     """
     messages = [{"role": "user", "content": "what is a b-tree"}]
     p_hash = raw_hash(messages)
-    params = params_hash(messages, temperature=1.0, max_tokens=1024, model="gemini-flash-latest")
+    params = params_hash(messages, temperature=1.0, max_tokens=1024, model="gemini-3.5-flash-lite")
 
-    key_tenant_a = ("tenant-a", p_hash, "gemini-flash-latest", params)
-    key_tenant_b = ("tenant-b", p_hash, "gemini-flash-latest", params)
+    key_tenant_a = ("tenant-a", p_hash, "gemini-3.5-flash-lite", params)
+    key_tenant_b = ("tenant-b", p_hash, "gemini-3.5-flash-lite", params)
 
     assert key_tenant_a != key_tenant_b

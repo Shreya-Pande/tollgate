@@ -12,10 +12,18 @@ import httpx  # noqa: E402
 from fastapi import FastAPI, Header, HTTPException  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
+from app.cache import admit, audit_output, constraints_to_json, search_candidates  # noqa: E402
 from app.config import settings  # noqa: E402
+from app.constraints import extract  # noqa: E402
 from app.db import init_pool, pool  # noqa: E402
 from app.embedder import encode  # noqa: E402
-from app.normalize import hash_api_key, normalize, params_hash, raw_hash  # noqa: E402
+from app.normalize import (  # noqa: E402
+    constraint_input,
+    hash_api_key,
+    normalize,
+    params_hash,
+    raw_hash,
+)
 from app.upstream import (  # noqa: E402
     call_upstream,
     charge_budget,
@@ -88,6 +96,50 @@ async def healthz():
     return {"status": "ok"}
 
 
+@app.get("/stats")
+async def stats():
+    """Minimal for now — just the audit-failure rates, added because they
+    must never be pooled. Full dashboard (hit rate by type, spend,
+    p50/p99, decision breakdown) is Phase 10 (§13, §16 — first thing to
+    cut under time pressure, but this pair isn't part of that).
+
+    HIT_EXACT and HIT_SEMANTIC audit failures mean different things and
+    are reported as two separate rates, never blended:
+      llm_compliance_failure_rate — HIT_EXACT audit failures. The prompt
+        was byte-identical to the one that produced the cached response;
+        a failure here is the LLM not following its own instruction, not
+        a cache error. This is the floor semantic matching can't beat —
+        even a perfect cache inherits the model's own non-compliance.
+      semantic_false_hit_rate — HIT_SEMANTIC audit failures. The cached
+        response doesn't satisfy the NEW prompt. This is a genuine false
+        hit, and the metric this whole project exists to measure.
+    Pooling them would attribute the model's own non-compliance to the
+    cache and inflate the semantic false-hit number.
+    """
+    rows = await pool().fetch(
+        """SELECT decision,
+                  count(*) FILTER (WHERE output_audit_ok IS NOT NULL) AS audited,
+                  count(*) FILTER (WHERE output_audit_ok = false) AS failures
+           FROM cache_decisions
+           WHERE decision IN ('HIT_EXACT', 'HIT_SEMANTIC')
+           GROUP BY decision"""
+    )
+    by_decision = {r["decision"]: {"audited": r["audited"], "failures": r["failures"]} for r in rows}
+
+    def rate(decision: str):
+        d = by_decision.get(decision, {"audited": 0, "failures": 0})
+        return {
+            "rate": (d["failures"] / d["audited"]) if d["audited"] else None,
+            "failures": d["failures"],
+            "audited": d["audited"],
+        }
+
+    return {
+        "llm_compliance_failure_rate": rate("HIT_EXACT"),
+        "semantic_false_hit_rate": rate("HIT_SEMANTIC"),
+    }
+
+
 DECISION_INSERT_SQL = """
 INSERT INTO cache_decisions (
     id, tenant_id, prompt_raw, constraints, embedding, candidate_id,
@@ -109,36 +161,42 @@ async def log_decision(
     prompt_raw: str,
     decision: str,
     cost_cents: float,
+    constraints: dict | None = None,
     embedding=None,
     candidate_id: uuid.UUID | None = None,
     cosine_similarity: float | None = None,
+    gate_passed: bool | None = None,
+    constraint_diff=None,
+    output_audit_ok: bool | None = None,
+    output_audit_diff: dict | None = None,
     embed_ms: float | None = None,
+    search_ms: float | None = None,
+    gate_ms: float | None = None,
     upstream_ms: float | None = None,
     total_ms: float | None = None,
 ) -> None:
-    """5f — every request writes exactly one of these, hit or miss, 429 or
-    upstream error. search_ms/gate_ms are always NULL for now: nothing
-    computes them yet (similarity search and the constraint gate are
-    Phase 7/8). Same for gate_passed/constraint_diff/output_audit_*.
+    """5f/8: every request writes exactly one of these — hit or miss, 429
+    or upstream error. `constraints` is the extracted request-constraint
+    dict (None before any embedding happens, e.g. the pre-flight 429).
     """
     await executor.execute(
         DECISION_INSERT_SQL,
         uuid.uuid4(),
         tenant_id,
         prompt_raw,
-        {},  # constraints — extractor not built yet (Phase 8)
+        constraints_to_json(constraints) if constraints is not None else {},
         embedding,
         candidate_id,
         cosine_similarity,
         settings.similarity_threshold,
-        None,  # gate_passed
-        None,  # constraint_diff
+        gate_passed,
+        constraint_diff,
         decision,
-        None,  # output_audit_ok
-        None,  # output_audit_diff
+        output_audit_ok,
+        output_audit_diff,
         embed_ms,
-        None,  # search_ms
-        None,  # gate_ms
+        search_ms,
+        gate_ms,
         upstream_ms,
         total_ms,
         cost_cents,
@@ -204,6 +262,17 @@ async def chat_completions(
     )
 
     if entry is not None:
+        # §7 output-constraint audit — even on an exact-hash match, the
+        # cached response was generated once, in the past, and the
+        # upstream model's own instruction-following at that time might
+        # not have been perfect (asked for 3 bullets, got 2). This is not
+        # re-checking the gate (that compares two prompts); it's checking
+        # the response against what was actually asked, every time it's
+        # served, for free.
+        request_text = constraint_input(messages)
+        request_constraints = extract(request_text)
+        audit_ok, audit_diff = audit_output(request_constraints, request_text, entry["response_text"])
+
         total_ms = (time.perf_counter() - t_start) * 1000
         async with pool().acquire() as conn:
             async with conn.transaction():
@@ -217,7 +286,10 @@ async def chat_completions(
                     prompt_raw=prompt_raw,
                     decision="HIT_EXACT",
                     cost_cents=0,
+                    constraints=request_constraints,
                     candidate_id=entry["id"],
+                    output_audit_ok=audit_ok,
+                    output_audit_diff=audit_diff or None,
                     total_ms=total_ms,
                 )
         return ChatCompletionResponse(
@@ -242,12 +314,91 @@ async def chat_completions(
         )
 
     # -----------------------------------------------------------------
-    # 5e — miss path. Embed, call upstream, store both rows in one
-    # transaction. Embedding is computed and stored even though nothing
-    # reads it yet — Phase 7 needs it and this avoids a backfill.
+    # 6a — embed + extract constraints. Needed whether this turns into a
+    # semantic hit or a genuine miss, so do both before deciding which.
     # -----------------------------------------------------------------
     normalized = normalize(messages)
     vector, embed_ms = encode(normalized)
+    request_text = constraint_input(messages)
+    request_constraints = extract(request_text)
+
+    # -----------------------------------------------------------------
+    # 6b — semantic search (§4 step 7) + admission (§5), with fall-
+    # through: a candidate that fails the gate doesn't end the search,
+    # the next-nearest candidate still gets a chance. No budget charged
+    # yet — search and gate cost nothing against the upstream budget,
+    # only a real miss does.
+    # -----------------------------------------------------------------
+    search_t0 = time.perf_counter()
+    candidates = await search_candidates(
+        pool(), tenant_id, req.model, p_hash, vector, settings.top_k
+    )
+    search_ms = (time.perf_counter() - search_t0) * 1000
+
+    gate_t0 = time.perf_counter()
+    result = admit(candidates, request_constraints, settings.similarity_threshold)
+    gate_ms = (time.perf_counter() - gate_t0) * 1000
+
+    if result["decision"] == "HIT_SEMANTIC":
+        candidate = result["candidate"]
+        audit_ok, audit_diff = audit_output(request_constraints, request_text, candidate["response_text"])
+        total_ms = (time.perf_counter() - t_start) * 1000
+        async with pool().acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE cache_entries SET hit_count = hit_count + 1 WHERE id = $1",
+                    candidate["id"],
+                )
+                await log_decision(
+                    conn,
+                    tenant_id=tenant_id,
+                    prompt_raw=prompt_raw,
+                    decision="HIT_SEMANTIC",
+                    cost_cents=0,
+                    constraints=request_constraints,
+                    embedding=vector,
+                    candidate_id=candidate["id"],
+                    cosine_similarity=result["similarity"],
+                    gate_passed=True,
+                    output_audit_ok=audit_ok,
+                    output_audit_diff=audit_diff or None,
+                    embed_ms=embed_ms,
+                    search_ms=search_ms,
+                    gate_ms=gate_ms,
+                    total_ms=total_ms,
+                )
+        return ChatCompletionResponse(
+            id=f"tollgate-{uuid.uuid4()}",
+            created=int(time.time()),
+            model=req.model,
+            choices=[
+                Choice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content=candidate["response_text"]),
+                    finish_reason="stop",
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=0,
+                completion_tokens=candidate["response_tokens"],
+                total_tokens=candidate["response_tokens"],
+            ),
+        )
+
+    # -----------------------------------------------------------------
+    # 6c — genuine miss (MISS_LOW_SIM / MISS_GATE / MISS_NO_CANDIDATE).
+    # Same miss path as before, plus: log the specific miss reason
+    # instead of one hardcoded decision, carry through the admission
+    # attempt's similarity/diff for debugging, and store the REAL
+    # extracted constraints on the new cache_entries row instead of {} —
+    # future searches need them to gate against.
+    # -----------------------------------------------------------------
+    miss_decision = result["decision"]
+    # gate_passed: True only means HIT. False means the gate ran and
+    # rejected every candidate (MISS_GATE). None means the gate was never
+    # reached at all — no candidates existed, or the top one was already
+    # below the similarity threshold — not "ran and failed."
+    gate_passed = False if miss_decision == "MISS_GATE" else None
 
     full_text = "".join(m["content"] for m in messages)
     estimated_prompt_tokens = len(full_text) // 4
@@ -261,8 +412,14 @@ async def chat_completions(
             prompt_raw=prompt_raw,
             decision="MISS_BUDGET_EXCEEDED",
             cost_cents=0,
+            constraints=request_constraints,
             embedding=vector,
+            cosine_similarity=result["similarity"],
+            gate_passed=gate_passed,
+            constraint_diff=result["diff"],
             embed_ms=embed_ms,
+            search_ms=search_ms,
+            gate_ms=gate_ms,
             total_ms=total_ms,
         )
         raise HTTPException(status_code=429, detail="tenant budget exceeded")
@@ -284,8 +441,14 @@ async def chat_completions(
             prompt_raw=prompt_raw,
             decision="MISS_UPSTREAM_ERROR",
             cost_cents=0,
+            constraints=request_constraints,
             embedding=vector,
+            cosine_similarity=result["similarity"],
+            gate_passed=gate_passed,
+            constraint_diff=result["diff"],
             embed_ms=embed_ms,
+            search_ms=search_ms,
+            gate_ms=gate_ms,
             upstream_ms=upstream_ms,
             total_ms=total_ms,
         )
@@ -315,17 +478,23 @@ async def chat_completions(
                     params_hash, response_text, response_tokens, cost_cents
                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)""",
                 entry_id, tenant_id, prompt_raw, r_hash, normalized,
-                {}, vector, settings.embedding_model, req.model,
-                p_hash, response_text, usage["completion_tokens"], real_cost,
+                constraints_to_json(request_constraints), vector, settings.embedding_model,
+                req.model, p_hash, response_text, usage["completion_tokens"], real_cost,
             )
             await log_decision(
                 conn,
                 tenant_id=tenant_id,
                 prompt_raw=prompt_raw,
-                decision="MISS_NO_CANDIDATE",
+                decision=miss_decision,
                 cost_cents=real_cost,
+                constraints=request_constraints,
                 embedding=vector,
+                cosine_similarity=result["similarity"],
+                gate_passed=gate_passed,
+                constraint_diff=result["diff"],
                 embed_ms=embed_ms,
+                search_ms=search_ms,
+                gate_ms=gate_ms,
                 upstream_ms=upstream_ms,
                 total_ms=total_ms,
             )

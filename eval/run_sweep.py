@@ -43,11 +43,28 @@ from sklearn.metrics import roc_auc_score, roc_curve
 load_dotenv()
 
 from app.config import settings  # noqa: E402
+from app.constraints import compatible as constraints_compatible  # noqa: E402
+from app.constraints import extract  # noqa: E402
 from app.db import init_pool, pool  # noqa: E402
 from app.normalize import normalize  # noqa: E402
 
 FIGURES_DIR = Path(__file__).parent / "figures"
 EMBED_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "embed_cache"
+
+# DECISION-V2: second model is BAAI/bge-base-en-v1.5 (local, via fastembed),
+# not Gemini's embedding API, despite it being technically available
+# (checked: gemini-embedding-001 returns 200). No published free-tier quota
+# exists for it, and this sweep needs ~5400 embeddings (2700 eval_pairs
+# rows x 2 sides) — the same "unknowable, apparently very tight quota"
+# problem that already stalled chat generation once today, at much higher
+# stakes (a bulk job, not a handful of test calls). Local costs nothing and
+# has no quota risk. This does weaken the argument from "even a frontier
+# API model" to "the failure persists across two local/architecture
+# scales" — noted in the README.
+MODELS = {
+    "minilm": "sentence-transformers/all-MiniLM-L6-v2",
+    "bge": "BAAI/bge-base-en-v1.5",
+}
 
 # DECISION-V2 (revised): ROC A was originally P1 (QQP) vs P2 (PAWS). That
 # AUC came back at 0.150 — a real number, but not a finding about safety.
@@ -101,9 +118,7 @@ def generate_synthetic_pairs(n: int = 500, overlap: float = 0.03, seed: int = 0)
 
 
 def scores(sim: np.ndarray, compatible: np.ndarray) -> dict[str, np.ndarray]:
-    """# I'll write this
-
-    The score-transform trick from TOLLGATE.md step 1.8: the gated rule
+    """The score-transform trick from TOLLGATE.md step 1.8: the gated rule
     (admit iff sim >= tau AND compatible) isn't a threshold on a
     continuous score, so it can't go into roc_curve/roc_auc_score
     directly. Mapping incompatible pairs to a value below any realistic
@@ -378,8 +393,70 @@ def _embedding_input(text: str) -> str:
     return normalize([{"role": "user", "content": text}])
 
 
+def compute_pair_compatibility(df: pd.DataFrame) -> np.ndarray:
+    """The gate's compatible() applied to every pair — model-independent
+    (constraint extraction never touches embeddings), so this runs once
+    and is reused across both embedding models rather than recomputed per
+    model. Extracted from the RAW prompt_a/prompt_b text (as stored),
+    matching production's constraint_input() — case preserved, same as
+    what app/main.py actually feeds extract().
+    """
+    return np.array(
+        [
+            constraints_compatible(extract(a), extract(b))[0]
+            for a, b in zip(df["prompt_a"], df["prompt_b"])
+        ],
+        dtype=bool,
+    )
+
+
+def _report_roc(
+    label: str,
+    out_key: str,
+    model_key: str,
+    y: np.ndarray,
+    sim: np.ndarray,
+    compat: np.ndarray,
+    thresholds: np.ndarray,
+) -> dict:
+    """Shared plot+AUC+print for one (label, y, sim, compat) triple — used
+    both for the top-level ROC_GROUPS and for ROC B's three-way family
+    breakdown (all-8 / in-design-5 / held-out-3), so that breakdown isn't
+    a second, drifting copy of the same reporting logic.
+    """
+    score_variants = scores(sim, compat)
+
+    roc_path = plot_roc(
+        y, score_variants, out_path=FIGURES_DIR / f"{model_key}_{out_key}.png", title=f"{label} ({model_key})"
+    )
+    sweep_results = sweep_thresholds(y, score_variants, thresholds)
+    hr_path = plot_hit_rate_vs_false_hit_rate(
+        sweep_results,
+        out_path=FIGURES_DIR / f"{model_key}_{out_key}_hit_rate.png",
+        title=f"{label} ({model_key}) — hit rate vs false-hit rate",
+    )
+
+    n_pos, n_neg = int(y.sum()), int((~y).sum())
+    aucs = {}
+    print(f"\n=== {label} — {model_key} ===")
+    print(f"n={len(y)}  n_pos={n_pos}  n_neg={n_neg}")
+    for variant, score in score_variants.items():
+        auc = roc_auc_score(y, score)
+        lo, hi = bootstrap_auc(y, score)
+        aucs[variant] = {"auc": auc, "ci": (lo, hi)}
+        print(f"{variant}: AUC={auc:.3f}  95% CI=[{lo:.3f}, {hi:.3f}]")
+    print(f"wrote {roc_path}")
+    print(f"wrote {hr_path}")
+
+    return {"label": label, "model": model_key, "n": len(y), "n_pos": n_pos, "n_neg": n_neg, "aucs": aucs}
+
+
 async def run_roc_group(
-    group_key: str, model: TextEmbedding, model_name: str, thresholds: np.ndarray
+    group_key: str,
+    model: TextEmbedding,
+    model_name: str,
+    model_key: str,
+    thresholds: np.ndarray,
 ) -> dict:
     group = ROC_GROUPS[group_key]
     df = await fetch_eval_pairs([group["positives"], group["negatives"]])
@@ -396,43 +473,67 @@ async def run_roc_group(
     all_vecs = embed_texts_cached(texts_a + texts_b, model, model_name)
     vec_a, vec_b = all_vecs[: len(texts_a)], all_vecs[len(texts_a):]
     sim = cosine_similarity_rows(vec_a, vec_b)
+    compat = compute_pair_compatibility(df)
 
-    # No gate yet (app/constraints.py is empty — Phase 8). One key only.
-    score_variants = {"cosine_only": sim}
+    result = _report_roc(group["label"], group_key, model_key, y, sim, compat, thresholds)
+    result["group"] = group_key
+    return result
 
-    roc_path = plot_roc(
-        y, score_variants, out_path=FIGURES_DIR / f"{group_key}.png", title=group["label"]
-    )
-    sweep_results = sweep_thresholds(y, score_variants, thresholds)
-    hr_path = plot_hit_rate_vs_false_hit_rate(
-        sweep_results,
-        out_path=FIGURES_DIR / f"{group_key}_hit_rate.png",
-        title=f"{group['label']} — hit rate vs false-hit rate",
-    )
 
-    auc = roc_auc_score(y, sim)
-    lo, hi = bootstrap_auc(y, sim)
-    n_pos, n_neg = int(y.sum()), int((~y).sum())
+# §8's own warning, acted on: "0.940 pooled across all 8 families is close
+# to tautological" — five of those families have a rule built specifically
+# to catch them, so a high pooled number mostly just confirms the rules
+# work on the cases they were written for. Held-out detection is the
+# number that says whether the approach generalizes past what was
+# anticipated, and it must never be reported without the pooled number, or
+# the pooled number reads as stronger evidence than it is.
+async def run_roc_b_breakdown(model: TextEmbedding, model_name: str, model_key: str, thresholds: np.ndarray) -> dict:
+    from eval.build_dataset import FAMILIES_HELD_OUT, FAMILIES_IN_DESIGN
 
-    print(f"\n=== {group['label']} ===")
-    print(f"n={len(y)}  n_pos={n_pos} ({group['positives']})  n_neg={n_neg} ({group['negatives']})")
-    print(f"cosine_only: AUC={auc:.3f}  95% CI=[{lo:.3f}, {hi:.3f}]")
-    print(f"wrote {roc_path}")
-    print(f"wrote {hr_path}")
+    group = ROC_GROUPS["roc_b"]
+    df = await fetch_eval_pairs([group["positives"], group["negatives"]])
+    texts_a = [_embedding_input(t) for t in df["prompt_a"]]
+    texts_b = [_embedding_input(t) for t in df["prompt_b"]]
+    all_vecs = embed_texts_cached(texts_a + texts_b, model, model_name)
+    vec_a, vec_b = all_vecs[: len(texts_a)], all_vecs[len(texts_a):]
+    df = df.copy()
+    df["sim"] = cosine_similarity_rows(vec_a, vec_b)
+    df["compat"] = compute_pair_compatibility(df)
 
-    return {
-        "group": group_key,
-        "label": group["label"],
-        "n": len(y),
-        "n_pos": n_pos,
-        "n_neg": n_neg,
-        "auc": auc,
-        "ci": (lo, hi),
+    control = df[df["population"] == group["positives"]]
+    subsets = {
+        "roc_b_all8": ("ROC B — all 8 families (pooled)", df[df["population"] == group["negatives"]]),
+        "roc_b_indesign5": (
+            "ROC B — in-design 5 only",
+            df[(df["population"] == group["negatives"]) & (df["family"].isin(FAMILIES_IN_DESIGN))],
+        ),
+        "roc_b_heldout3": (
+            "ROC B — held-out 3 only",
+            df[(df["population"] == group["negatives"]) & (df["family"].isin(FAMILIES_HELD_OUT))],
+        ),
     }
+
+    results = {}
+    for out_key, (label, negatives) in subsets.items():
+        combined = pd.concat([control, negatives])
+        y = combined["safe_to_reuse"].to_numpy(dtype=bool)
+        sim = combined["sim"].to_numpy()
+        compat = combined["compat"].to_numpy()
+        results[out_key] = _report_roc(label, out_key, model_key, y, sim, compat, thresholds)
+
+    gated_all8 = results["roc_b_all8"]["aucs"]["gated"]["auc"]
+    gated_indesign = results["roc_b_indesign5"]["aucs"]["gated"]["auc"]
+    gated_heldout = results["roc_b_heldout3"]["aucs"]["gated"]["auc"]
+    print(f"\n=== ROC B gated, {model_key}: pooled vs decomposed (report together, never pooled alone) ===")
+    print(f"  all 8 families (pooled):  AUC={gated_all8:.3f}")
+    print(f"  in-design 5 only:         AUC={gated_indesign:.3f}")
+    print(f"  held-out 3 only:          AUC={gated_heldout:.3f}  <- the generalization result")
+
+    return results
 
 
 async def p1_admission_rate(
-    model: TextEmbedding, model_name: str, thresholds_of_interest=(0.90, 0.95, 0.99)
+    model: TextEmbedding, model_name: str, model_key: str, thresholds_of_interest=(0.90, 0.95, 0.99)
 ) -> dict:
     """P1 (QQP genuine duplicates) has no matched negative population
     anymore, so it's not an ROC — reported as a single number instead:
@@ -449,7 +550,7 @@ async def p1_admission_rate(
     vec_a, vec_b = all_vecs[: len(texts_a)], all_vecs[len(texts_a):]
     sim = cosine_similarity_rows(vec_a, vec_b)
 
-    print(f"\n=== P1 admission rate (QQP genuine duplicates, n={len(sim)}) ===")
+    print(f"\n=== P1 admission rate ({model_key}, QQP genuine duplicates, n={len(sim)}) ===")
     rates = {}
     for tau in thresholds_of_interest:
         rate = float(np.mean(sim >= tau))
@@ -458,6 +559,108 @@ async def p1_admission_rate(
         print(f"  at tau={tau}: {rate:.1%} of genuine paraphrases would be admitted{flag}")
     print(f"  mean sim={sim.mean():.3f}  median={np.median(sim):.3f}")
     return {"n": len(sim), "mean_sim": float(sim.mean()), "rates": rates}
+
+
+async def per_family_detection() -> dict:
+    """§8: 'per-family detection: the five in-design families vs the three
+    held out, separately.' Model-independent — the gate's compatible()
+    never touches embeddings, so this runs once, not once per model.
+    Detection = the gate correctly flags the pair as incompatible
+    (compatible()==False for a P3 row, which is always safe_to_reuse=False
+    by construction). Held-out families have no rule targeting them by
+    design; a nonzero rate there means the general-purpose dimensions
+    (entities catching a numeral, say) happened to catch it anyway, not
+    that a hidden rule exists.
+    """
+    from eval.build_dataset import FAMILIES_HELD_OUT, FAMILIES_IN_DESIGN
+
+    df = await fetch_eval_pairs(["P3"])
+    compat = compute_pair_compatibility(df)
+    df = df.copy()
+    df["detected"] = ~compat
+    detection = df.groupby("family")["detected"].mean().sort_values(ascending=False)
+
+    print("\n=== Per-family detection rate (gate correctly flags the perturbation) ===")
+    for family in list(FAMILIES_IN_DESIGN) + list(FAMILIES_HELD_OUT):
+        tag = "held-out" if family in FAMILIES_HELD_OUT else "in-design"
+        rate = detection.get(family, float("nan"))
+        print(f"  {family:10s} ({tag:9s}): {rate:.1%}")
+
+    in_design_mean = detection[[f for f in FAMILIES_IN_DESIGN if f in detection]].mean()
+    held_out_mean = detection[[f for f in FAMILIES_HELD_OUT if f in detection]].mean()
+    print(f"  in-design mean: {in_design_mean:.1%}   held-out mean: {held_out_mean:.1%}")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    colors = ["#d95f02" if f in FAMILIES_HELD_OUT else "#1b9e77" for f in detection.index]
+    ax.barh(detection.index, detection.values, color=colors)
+    ax.set_xlabel("Detection rate (compatible() correctly returns False)")
+    ax.set_title("Per-family detection — in-design vs held-out")
+    ax.set_xlim(0, 1)
+    from matplotlib.patches import Patch
+
+    ax.legend(
+        handles=[
+            Patch(color="#1b9e77", label="in-design (rules exist)"),
+            Patch(color="#d95f02", label="held-out (no rules — generalization test)"),
+        ],
+        loc="lower right",
+        fontsize=8,
+    )
+    fig.tight_layout()
+    out_path = FIGURES_DIR / "per_family_detection.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"wrote {out_path}")
+
+    return {
+        "by_family": detection.to_dict(),
+        "in_design_mean": float(in_design_mean),
+        "held_out_mean": float(held_out_mean),
+    }
+
+
+async def false_hits_by_dimension(model: TextEmbedding, model_name: str, model_key: str) -> dict:
+    """§3/Day-3: 'the most quotable output in the project.' Among P3
+    (unsafe) pairs that cosine-ALONE would admit at the operating
+    threshold (settings.similarity_threshold), break down by family —
+    this is what the gate has to catch, concretely, not abstractly.
+    """
+    tau = settings.similarity_threshold
+    df = await fetch_eval_pairs(["P3"])
+    texts_a = [_embedding_input(t) for t in df["prompt_a"]]
+    texts_b = [_embedding_input(t) for t in df["prompt_b"]]
+    all_vecs = embed_texts_cached(texts_a + texts_b, model, model_name)
+    vec_a, vec_b = all_vecs[: len(texts_a)], all_vecs[len(texts_a):]
+    df = df.copy()
+    df["sim"] = cosine_similarity_rows(vec_a, vec_b)
+
+    false_hits = df[df["sim"] >= tau]
+    counts = false_hits.groupby("family").size()
+    rate_within_family = (counts / df.groupby("family").size()).fillna(0).sort_values(ascending=False)
+
+    print(f"\n=== False hits by dimension ({model_key}, cosine-only @ tau={tau}) ===")
+    print(f"total false hits: {len(false_hits)} / {len(df)} P3 pairs ({len(false_hits) / len(df):.1%})")
+    for family, rate in rate_within_family.items():
+        print(f"  {family:10s}: {counts.get(family, 0)} false hits ({rate:.1%} of that family)")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.barh(rate_within_family.index, rate_within_family.values, color="#7570b3")
+    ax.set_xlabel(f"Fraction of family admitted by cosine-only alone (tau={tau})")
+    ax.set_title(f"False hits by dimension — cosine-only, {model_key}")
+    ax.set_xlim(0, 1)
+    fig.tight_layout()
+    out_path = FIGURES_DIR / f"{model_key}_false_hits_by_dimension.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"wrote {out_path}")
+
+    return {
+        "total_false_hits": int(len(false_hits)),
+        "total_p3": int(len(df)),
+        "by_family": rate_within_family.to_dict(),
+    }
 
 
 def plot_family_similarity(p3_df: pd.DataFrame, control_mean: float, out_path: Path = None) -> Path:
@@ -498,35 +701,59 @@ def plot_family_similarity(p3_df: pd.DataFrame, control_mean: float, out_path: P
     return out_path
 
 
-async def plot_p3_family_breakdown(model: TextEmbedding, model_name: str) -> Path:
+async def plot_p3_family_breakdown(model: TextEmbedding, model_name: str, model_key: str) -> Path:
     df = await fetch_eval_pairs(["P3", "P3_control"])
     texts_a = [_embedding_input(t) for t in df["prompt_a"]]
     texts_b = [_embedding_input(t) for t in df["prompt_b"]]
     all_vecs = embed_texts_cached(texts_a + texts_b, model, model_name)
     vec_a, vec_b = all_vecs[: len(texts_a)], all_vecs[len(texts_a):]
+    df = df.copy()
     df["sim"] = cosine_similarity_rows(vec_a, vec_b)
 
     p3 = df[df["population"] == "P3"]
     control_mean = df[df["population"] == "P3_control"]["sim"].mean()
 
-    path = plot_family_similarity(p3, control_mean)
-    print(f"\n=== P3 per-family similarity (P3_control mean={control_mean:.3f}) ===")
+    path = plot_family_similarity(
+        p3, control_mean, out_path=FIGURES_DIR / f"{model_key}_p3_family_similarity.png"
+    )
+    print(f"\n=== P3 per-family similarity ({model_key}, P3_control mean={control_mean:.3f}) ===")
     print(p3.groupby("family")["sim"].agg(["mean", "median"]).sort_values("mean").to_string())
     print(f"wrote {path}")
     return path
 
 
+def print_auc_table(all_results: list[dict]) -> None:
+    print("\n=== AUC table (95% CI) ===")
+    header = f"{'group':8s} {'model':6s} {'variant':12s} {'AUC':>6s}  95% CI"
+    print(header)
+    print("-" * len(header))
+    for r in all_results:
+        for variant, v in r["aucs"].items():
+            lo, hi = v["ci"]
+            print(f"{r['group']:8s} {r['model']:6s} {variant:12s} {v['auc']:.3f}  [{lo:.3f}, {hi:.3f}]")
+
+
 async def main_real() -> dict:
     await init_pool()
-    model_name = settings.embedding_model
-    model = TextEmbedding(model_name, cache_dir=settings.fastembed_cache_path)
     thresholds = np.arange(0.70, 1.001, 0.005)
 
-    results = {}
-    for group_key in ROC_GROUPS:
-        results[group_key] = await run_roc_group(group_key, model, model_name, thresholds)
-    results["p1"] = await p1_admission_rate(model, model_name)
-    await plot_p3_family_breakdown(model, model_name)
+    results = {"roc": [], "p1": {}, "false_hits": {}, "roc_b_breakdown": {}}
+    for model_key, model_name in MODELS.items():
+        print(f"\n{'#' * 70}\n# MODEL: {model_key} ({model_name})\n{'#' * 70}")
+        model = TextEmbedding(model_name, cache_dir=settings.fastembed_cache_path)
+        for group_key in ROC_GROUPS:
+            results["roc"].append(
+                await run_roc_group(group_key, model, model_name, model_key, thresholds)
+            )
+        results["p1"][model_key] = await p1_admission_rate(model, model_name, model_key)
+        await plot_p3_family_breakdown(model, model_name, model_key)
+        results["false_hits"][model_key] = await false_hits_by_dimension(model, model_name, model_key)
+        results["roc_b_breakdown"][model_key] = await run_roc_b_breakdown(
+            model, model_name, model_key, thresholds
+        )
+
+    results["per_family_detection"] = await per_family_detection()
+    print_auc_table(results["roc"])
 
     await pool().close()
     return results
