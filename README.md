@@ -186,25 +186,35 @@ accuracy was never in question, the rejection is purely economic.
 ([numbers.md, "GPTCache default false-hit rate"](numbers.md))
 
 GPTCache (0.1.44), benchmarked on this project's own eval pairs (n=2300:
-P2, P2_control, P3, P3_control), pure defaults (`Onnx()` embedding,
+P2, P2_control, P3, P3_control — all four are near-duplicates by
+construction, some safe, some not), pure defaults (`Onnx()` embedding,
 `SearchDistanceEvaluation()`, `similarity_threshold=0.8`) — no threshold
 tuning, matching the brief of reporting GPTCache's *defaults*, not a swept
 best case.
 
-**Result: 2300/2300 pairs hit (100%) — every population, every
-perturbation family, no variation.** Read as this project's own ROC A/B
-operating point (single decision, not swept): **TPR=1.0, FPR=1.0**. Zero
-discrimination between safe and unsafe reuse on this adversarial set — it
-hits on a constraint-violating near-duplicate exactly as often as a
-genuinely safe one.
+**Precise claim:** on a set deliberately built from near-duplicates,
+GPTCache admitted every pair (2300/2300, every population, every
+perturbation family) — **it does not discriminate between safe and unsafe
+reuse in the near-duplicate regime.** Read as this project's own ROC A/B
+operating point (single decision, not swept): TPR=1.0, FPR=1.0 — no
+separation at all.
 
-Not "GPTCache is broken": a smoke test with a wildly unrelated pair
-correctly misses. Its default threshold is calibrated for everyday
-paraphrase reuse, not the adversarially-constructed near-duplicates this
-project's eval set exists to probe (a single swapped word that flips a
-count, a negation, a language, an entity). That's this project's opening
-claim, demonstrated on someone else's tool instead of just argued in the
-abstract.
+**This is a defaults-calibration finding in the near-duplicate regime, not
+a claim that the library is broken.** `scripts/gptcache_smoke.py` puts one
+prompt in cache and queries it against a completely unrelated one ("What is
+a hash map?" vs "...gardening?") — GPTCache **correctly misses.** It does
+separate unrelated topics; it just doesn't separate near-duplicates that
+differ in one constraint-relevant way (a swapped count, a negation, a
+language, an entity).
+
+**Why the near-duplicate regime is the one that matters, not a corner
+case:** separating unrelated topics is the easy half of admission — the
+control above shows GPTCache clears that bar trivially. The reason a
+*semantic* cache exists at all, rather than plain exact-match, is to handle
+near-duplicates. That's exactly the regime this measurement probes, and
+exactly where the default threshold shows zero discrimination. A tool that
+gets the easy case right and the operating case wrong is a calibration
+finding about the default threshold — stated precisely, not overstated.
 
 **Root-caused, not assumed:** the first full run showed the same 100% hit
 rate, initially suspected to be a Windows `shutil.rmtree` file-lock bug
@@ -214,8 +224,8 @@ of the default config on this data.
 
 This project's own gated MiniLM ROC B reaches AUC 0.940 with a real
 FPR/TPR tradeoff curve to pick an operating point from (§7); GPTCache's
-defaults offer no such curve here — at its own out-of-the-box setting it
-doesn't reject anything in this set at all.
+defaults offer no such curve in the near-duplicate regime — at its own
+out-of-the-box setting it doesn't discriminate within that regime at all.
 
 ## 7. Choosing an operating point
 
@@ -342,9 +352,11 @@ directly benchmarked (§6): a semantic cache with a fixed similarity
 threshold and, out of the box, no compatibility gate. Its caching
 infrastructure — storage backends, eviction, multi-provider adapters — is
 more mature and complete than anything built here; what's compared is
-narrower and specific: its default admission decision on this project's
-adversarial eval set, where it shows zero discrimination (100% hit rate,
-§6). Everything else here — the binary-classifier evaluation methodology
+narrower and specific: its default admission decision within the
+near-duplicate regime, where it shows zero discrimination between safe and
+unsafe reuse (§6) — while correctly separating unrelated topics, which is
+the easier case a semantic cache isn't really being tested on. Everything
+else here — the binary-classifier evaluation methodology
 (ROC/AUC/CI over labeled pairs), the held-out-family generalization test,
 the score-transform trick that makes a hybrid rule+threshold admission rule
 representable as one ROC axis, the output-constraint audit as a continuous

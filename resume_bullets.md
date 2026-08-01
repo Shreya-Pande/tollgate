@@ -32,11 +32,15 @@ flattering average).
 > both models, CIs added 2026-08-04), "In-design vs held-out vs P2
 > detection" (register/polarity 0.0%, temporal 99.3%-but-artifact).
 
-Benchmarked GPTCache's default configuration on the same pairs at **100%**
-false hits — zero discrimination between safe and unsafe reuse at its
-out-of-the-box threshold — and added a zero-cost output-constraint audit
-giving a continuous production false-hit lower bound.
+Benchmarked GPTCache's default configuration on the same near-duplicate
+pairs and found zero discrimination between safe and unsafe reuse in that
+regime (it separates unrelated topics correctly — verified with a control —
+but the near-duplicate regime is the one a semantic cache exists to
+operate in); added a zero-cost output-constraint audit giving a continuous
+production false-hit lower bound of my own.
 
 > Source: numbers.md "GPTCache default false-hit rate" (2300/2300 hit,
-> TPR=FPR=1.0 on P2/P3) and "Output-audit failure rate" (§7,
+> TPR=FPR=1.0 on P2/P3, all four populations near-duplicates by
+> construction; unrelated-topic control in `scripts/gptcache_smoke.py`
+> correctly misses) and "Output-audit failure rate" (§7,
 > `semantic_false_hit_rate`, live via `GET /stats`).

@@ -268,7 +268,15 @@ operating point" and "Hit rate" below.
   since `Config().similarity_threshold` was left untouched, matching the
   brief ("report the number for GPTCache's defaults").
 
-**Result: 2300/2300 pairs hit (100%), no variation by population or family.**
+**Precise claim (narrowed 2026-08-05 — the "100% false-hit rate" framing
+below invited exactly the wrong question, "did you configure it right?"):**
+on a set deliberately built from near-duplicates — every pair in P2/P2_control/
+P3/P3_control is a near-duplicate by construction, some safe (controls),
+some not — GPTCache admitted every single one at its default threshold.
+**It does not discriminate between safe and unsafe reuse in the
+near-duplicate regime.** That is not the same claim as "GPTCache always
+returns hits" or "GPTCache is broken" — see the unrelated-topic control
+below, which it passes correctly.
 
   | population   | n    | safe_to_reuse | gptcache_hit |
   |--------------|------|----------------|--------------|
@@ -280,33 +288,39 @@ operating point" and "Hit rate" below.
   P3 by family (all 8, all n=150): entity, format, language, negation,
   numeric, polarity, register, temporal — every one 100%.
 
-- Read as this project's ROC A / ROC B analogs (single operating point, GPTCache's default,
-  not swept): **TPR=1.0, FPR=1.0** on both. GPTCache's default config
-  exercises zero discrimination on this project's adversarial hard-negative
-  set — it hits on every constraint-violating near-duplicate exactly as often
-  as it hits on every genuinely-safe one.
-- **Flagging, not celebrating:** this is not "GPTCache is bad" — it's that its
-  default `similarity_threshold=0.8` (cosine distance path via
-  `SearchDistanceEvaluation`) is calibrated for typical paraphrase reuse, not
-  for the kind of adversarially-constructed near-duplicate-but-incompatible
-  pairs this project's P2/P3 populations deliberately contain (single-word
-  swaps that flip a count, a negation, a language, an entity). A smoke test
-  with a wildly unrelated pair (`gptcache_smoke.py`: "What is a hash map?" vs
-  "...gardening?") correctly returns a miss, confirming the cache isn't
-  simply broken — its notion of "similar enough" is just far looser than what
-  a constraint gate catches.
+- Read as this project's ROC A / ROC B analogs (single operating point,
+  GPTCache's default, not swept): **TPR=1.0, FPR=1.0** on both — no
+  separation at all between the safe and unsafe near-duplicate populations.
+- **Unrelated-topic control (evidence this is a calibration finding, not a
+  "the tool is broken" claim):** `scripts/gptcache_smoke.py` — "What is a
+  hash map?" cached, then queried against "What is a completely unrelated
+  topic about gardening?" — **correctly returns a miss.** GPTCache's
+  default threshold does separate obviously-unrelated topics; it just
+  doesn't separate near-duplicates that differ in one constraint-relevant
+  way (a swapped number, a negation, a language, an entity).
+- **Why the near-duplicate regime is the one that matters, not a corner
+  case:** separating unrelated topics is the easy half of cache admission —
+  a low bar most similarity thresholds clear trivially, as the control above
+  shows. The reason a *semantic* cache exists at all, rather than an
+  exact-match cache, is to handle near-duplicates — prompts that are almost
+  the same but not identical. That is exactly the regime this measurement
+  probes, and exactly where GPTCache's default shows zero discrimination.
+  A tool that gets the easy case right and the operating case wrong is a
+  calibration finding about the default threshold, stated precisely — not
+  a claim that the library doesn't work.
 - **Root-caused, not assumed:** the first full run (~95 min) showed the same
   100% hit rate, which was initially suspected to be a Windows
   `shutil.rmtree(..., ignore_errors=True)` bug leaking cache state across
   pairs sharing one data dir. Fixed (unique dir per pair) and re-run in full
-  — the 100% figure above is from the corrected run and did not change,
+  — the figure above is from the corrected run and did not change,
   confirming it's a real property of the default config on this data, not
   the file-lock bug.
 - **This is the headline comparison for the prior-work section:** this
   project's own gated MiniLM ROC B (all-8) reaches AUC 0.940 with a real
   FPR/TPR tradeoff curve to choose an operating point from (e.g. FPR 0.109 at
-  TPR 0.753); GPTCache's default has no such curve to offer here — at its own
-  out-of-the-box setting it doesn't reject anything in this set at all.
+  TPR 0.753); GPTCache's default has no such curve to offer in the
+  near-duplicate regime — at its own out-of-the-box setting it doesn't
+  discriminate within that regime at all.
 
 ## p50/p99 — hit path
 
