@@ -8,6 +8,40 @@ Full numbers, with dates and sample sizes, live in [numbers.md](numbers.md).
 Anything stated here without a number attached is an opinion, not a result —
 check numbers.md before trusting a specific figure quoted from memory.
 
+**Live:** [tollgate-fu81.onrender.com](https://tollgate-fu81.onrender.com)
+(Render free tier, Singapore — same region as the Neon database, so the
+latency numbers in §8 are meaningful). Free tier sleeps after ~15 minutes
+idle; the first request after a sleep is a real 30s+ cold start, not a bug.
+
+## Try it
+
+The exact-match path (no auth needed to see the shape, but the endpoint
+itself requires a tenant key — see below for getting one):
+
+```bash
+curl https://tollgate-fu81.onrender.com/healthz
+```
+
+To see a real `HIT_SEMANTIC` — the cached prompt is "What is the Zhou
+Dynasty?"; this asks a differently-worded question and gets the same
+cached answer back with no upstream call:
+
+```bash
+curl -X POST https://tollgate-fu81.onrender.com/v1/chat/completions \
+  -H "Authorization: Bearer $TOLLGATE_DEMO_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gemini-flash-latest", "messages": [{"role": "user", "content": "What exactly is the Zhou Dynasty?"}], "temperature": 1.0, "max_tokens": 200}'
+```
+
+No demo key is committed here on purpose (it's a live credential against a
+real, if budget-capped, deployment — a public repo isn't the place for it).
+Get your own by running `python scripts/seed_tenant.py` against the same
+`DATABASE_URL` (see §11, Setup) — it prints a fresh tenant + key once, not
+stored anywhere in plaintext. **First request after an idle period will be
+slow** (Render free-tier cold start, 30s+ before anything responds) — this
+is expected, not the number in §8; that section's deployed-latency row is
+measured warm, server-side, via `total_ms`.
+
 ## 1. The question
 
 How often does a semantic cache serve a wrong answer, and how would you
@@ -271,13 +305,13 @@ tau=0.95 wasn't separately pulled for BGE.
 ([numbers.md, "embed / search / gate ms", "p50/p99 — hit/miss path",
 "LLM-gate latency and cost"](numbers.md))
 
-**Hardware: Intel Core i3-1005G1 @ 1.20GHz, CPU-only ONNX (fastembed), local
-dev, network-bound to Neon (ap-southeast-1).** A deployed-instance
-measurement, same region as the database, is planned but not yet available
-as of this writing — see §10 (setup) for status; local-dev numbers below are
-network-bound and not the number that belongs in a resume bullet.
+**Local dev hardware: Intel Core i3-1005G1 @ 1.20GHz, CPU-only ONNX
+(fastembed), network-bound to Neon (ap-southeast-1) over the open
+internet.** These numbers are real but not the ones to trust for
+production cost — see the deployed row below, which is what actually
+belongs in a resume bullet.
 
-| Stage | Mean |
+| Stage | Mean (local dev) |
 |---|---|
 | Embed (MiniLM, single-text, post-warmup) | 58.3–62.2ms |
 | Embed (BGE-base, single-text, post-warmup) | **35.3ms** |
@@ -293,6 +327,29 @@ network-bound and not the number that belongs in a resume bullet.
 | HIT_SEMANTIC | 708–713ms (too small for a percentile) | — | 2 |
 | MISS_NO_CANDIDATE | 3654ms | 11940ms (real Gemini variance) | 23 |
 | MISS_UPSTREAM_ERROR | 1876ms | 2788ms | 115 (mostly one rate-limited burst) |
+
+**Deployed, Render Singapore (same region as Neon), warm, `total_ms`
+measured server-side** — this excludes the client network hop entirely,
+unlike the local-dev numbers above:
+
+| decision | p50 | p99 | n |
+|---|---|---|---|
+| HIT_EXACT | **9.9ms** | 189.8ms | 10 |
+| HIT_SEMANTIC | **2668.7ms** | 3461.7ms | 6 |
+
+HIT_EXACT is dramatically faster once the network hop is removed — a
+straight hash lookup, no embedding call. **HIT_SEMANTIC is dramatically
+*slower* than local dev** (2668.7ms vs 708–713ms), and it isn't the
+network: embed_ms alone averaged **2266.7ms** on the deployed instance,
+roughly 20–40x the local warm figure (58–112ms), measured server-side
+with no DB or network component. The likely explanation is free-tier
+CPU throttling/shared-vCPU contention on ONNX inference — plausible, not
+independently confirmed. Full breakdown, plus an unresolved anomaly
+(the first two live embedding calls on this container came back with
+similarity scores that didn't match an offline recomputation of the same
+text — most likely a redeploy-transition artifact, flagged rather than
+swept under the rug) in numbers.md, "p50/p99 — deployed, Render
+Singapore, warm, same region as Neon."
 
 **Cost: $0 total project spend to date** — running entirely on Gemini's
 free tier (`gemini-3.5-flash-lite`, pinned; see numbers.md for why not the
@@ -437,7 +494,10 @@ subset is regenerated manually via `scripts/freeze_ci_subset.py` when
 `eval_pairs` changes enough to warrant a new baseline — not run by CI
 itself.
 
-**Deployment:** not yet live as of this writing. Planned target is a
-free-tier host in the same region as Neon (ap-southeast-1) to keep the
-latency numbers in §8 meaningful; this README will be updated with a
-deployed-instance latency row once that happens.
+**Deployment:** live at
+[tollgate-fu81.onrender.com](https://tollgate-fu81.onrender.com) (Render
+free tier, Singapore, same region as Neon). Migrations were applied once
+from local against the same Neon instance the deployed service uses —
+`python migrations/run.py` is idempotent (tracks applied migrations in
+`_migrations`) but isn't part of the deploy step itself; re-run it by hand
+only after adding a new migration file.

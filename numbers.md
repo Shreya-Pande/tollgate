@@ -356,6 +356,72 @@ below, which it passes correctly.
   margin — this app's own overhead is small next to Gemini's response
   time).
 
+## p50/p99 — deployed, Render Singapore, warm, same region as Neon
+
+- 2026-08-05, Phase 10 (Task 3), deployed instance
+  (`https://tollgate-fu81.onrender.com`, Render free tier, Singapore —
+  same region as Neon), via `percentile_cont` over `cache_decisions`,
+  `total_ms` (server-side, excludes the client network hop — this is not
+  curl-timed from a local machine). Traffic generated specifically for
+  this measurement: exact-match repeats of an already-cached prompt (zero
+  quota) and paraphrases of already-cached prompts pre-verified **offline**
+  (embedded locally with the same model, cosine similarity checked against
+  the real stored vectors before ever sending a live request) to land
+  above the 0.95 gate threshold — avoiding accidental genuine misses,
+  since a miss on this codepath always calls the real upstream model
+  (see the anomaly below for what happened when that precaution wasn't
+  enough).
+
+  | decision | n | p50 | p99 |
+  |---|---|---|---|
+  | HIT_EXACT | 10 | **9.9ms** | 189.8ms |
+  | HIT_SEMANTIC | 6 | **2668.7ms** | 3461.7ms |
+
+  Mean stage breakdown across these decisions: embed_ms=2266.7ms (n=8),
+  search_ms=90.1ms (n=8), gate_ms=0.022ms (n=8).
+
+  **The deployed HIT_SEMANTIC p50 (2668.7ms) is the number for the resume
+  bullet — not local dev's 708-713ms placeholder (n=2), which was
+  network-bound and not representative.** HIT_EXACT is dramatically
+  faster (9.9ms server-side — no embedding call at all, straight hash
+  lookup) and IS representative of what most cache hits will cost once
+  the exact-match path is doing its share of the work (§9.3's own finding
+  that exact-match may carry most of the achievable savings).
+
+  **Surprising result, reported as measured:** embed_ms on Render's free
+  tier (2266.7ms mean) is roughly 20-40x local dev's warm figure
+  (58-112ms) — not a network artifact (total_ms already excludes the
+  client hop; embed_ms is measured server-side, DB-call-free). The likely
+  explanation is free-tier CPU throttling/shared-vCPU contention on a
+  ~2266ms single-sentence ONNX inference that takes ~60-900ms locally on
+  a real (if modest) laptop CPU — plausible, not independently confirmed.
+  This is the real cost of "CPU-only, no GPU, free tier" for an
+  embedding-per-request design, and it means the gate's own ~0.03ms is
+  even more negligible here, relatively, than it already was locally.
+
+  **Unresolved anomaly, flagged rather than hidden:** the first two live
+  requests that exercised the embedding path on this container (both
+  paraphrases pre-verified offline to score ≥0.95 similarity) came back
+  as `MISS_LOW_SIM` with similarity 0.26 and 0.21 — nowhere near the
+  offline-computed 0.98 against the same stored target vectors, confirmed
+  by re-ranking all 25 of the tenant's cached vectors against a fresh
+  local re-embed of the same text (see `numbers.md` git history / session
+  log for the diagnostic query). Both genuine misses triggered a real
+  upstream call — **2 of today's ~20 Gemini requests spent on this,
+  unintentionally.** All four other pre-verified paraphrases sent
+  immediately after (and both of these same two texts, resent) matched
+  expectations correctly. embed_ms for these two rows (1440ms, 1765ms)
+  wasn't unusually fast or slow relative to the other six — ruling out
+  "rushed, incomplete inference" as the cause. Most likely explanation:
+  these two requests landed on a container mid-transition from the
+  `/stats` security-fix deploy (pushed minutes earlier, and Render
+  auto-deploys on push) — genuinely not confirmed, stated as a hypothesis,
+  not a finding. Practical implication worth carrying forward: a fresh
+  deploy's first live requests should not be trusted for either latency
+  *or* correctness until a real (non-`/healthz`) request has round-tripped
+  successfully — `/healthz` only touches the DB, never the embedding
+  model, so it cannot warm or verify this path.
+
 ## embed / search / gate ms
 
 - 2026-08-01, local dev (Intel Core i3-1005G1 @ 1.20GHz, CPU-only ONNX via fastembed):

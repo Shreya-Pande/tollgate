@@ -8,14 +8,22 @@ see the second bullet), the wording was changed instead of the number.
 
 ---
 
-Built an OpenAI-compatible LLM gateway (FastAPI, PostgreSQL/pgvector,
-Docker, CI) whose cache admission decision is evaluated as a binary
-classifier: **75.3%** hit rate at a measured **10.9%** false-hit rate,
-cutting p50 latency from **3654ms** to **472ms**.
+Built and deployed an OpenAI-compatible LLM gateway (FastAPI,
+PostgreSQL/pgvector, Docker, CI) whose cache admission decision is
+evaluated as a binary classifier: **75.3%** hit rate at a measured
+**10.9%** false-hit rate, cutting p50 latency from **3654ms** (a real
+miss) to **2669ms** (a real semantic hit) measured server-side on the
+live deployed instance — not a local/network-inflated number.
 
 > Source: numbers.md "Hit rate" / "False-hit rate at operating point" (ROC
-> B, MiniLM+gate, tau=0.95, TPR=0.753/FPR=0.109) and "p50/p99 — hit/miss
-> path" (MISS_NO_CANDIDATE p50=3654ms, n=23; HIT_EXACT p50=472ms, n=67).
+> B, MiniLM+gate, tau=0.95, TPR=0.753/FPR=0.109); "p50/p99 — deployed,
+> Render Singapore" (HIT_SEMANTIC p50=2668.7ms, n=6, deployed instance,
+> `total_ms` server-side); miss-side p50 (3654ms, n=23) is still the local
+> MISS_NO_CANDIDATE figure — a clean deployed genuine-miss sample wasn't
+> collected, to avoid spending more of the ~20/day upstream quota than
+> the deployment verification already did. The deployed HIT_EXACT p50
+> (9.9ms) is far faster than either number but isn't what's cited here —
+> the semantic path is the one this project's whole methodology is about.
 
 Showed cosine-only admission is dominated on a **2700**-pair labelled set
 (QQP/PAWS + programmatically perturbed instructions); a **0.03ms**
