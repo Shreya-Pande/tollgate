@@ -89,40 +89,59 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/healthz")
 async def healthz():
+    # Liveness only — no DB error text, no version string. This is a public,
+    # unauthenticated endpoint (Render/uptime checks hit it); the real
+    # exception (which can contain host/connection details) goes to server
+    # logs via print, never into the HTTP response.
     try:
         await pool().fetchval("SELECT 1")
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"db unreachable: {e}")
+        print(f"healthz: db unreachable: {e}")
+        raise HTTPException(status_code=503, detail="unhealthy")
     return {"status": "ok"}
 
 
+async def resolve_tenant(authorization: str | None) -> uuid.UUID:
+    """Shared by /v1/chat/completions and /stats — same Bearer-token
+    resolution, same 401s, so the two endpoints can't drift apart on what
+    counts as a valid key.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing or malformed Authorization header")
+    api_key = authorization.removeprefix("Bearer ").strip()
+
+    tenant = await pool().fetchrow(
+        "SELECT id FROM tenants WHERE api_key_hash = $1", hash_api_key(api_key)
+    )
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="unknown api key")
+    return tenant["id"]
+
+
 @app.get("/stats")
-async def stats():
+async def stats(authorization: str | None = Header(default=None)):
     """Minimal for now — just the audit-failure rates, added because they
     must never be pooled. Full dashboard (hit rate by type, spend,
     p50/p99, decision breakdown) is Phase 10 (§13, §16 — first thing to
     cut under time pressure, but this pair isn't part of that).
 
-    HIT_EXACT and HIT_SEMANTIC audit failures mean different things and
-    are reported as two separate rates, never blended:
-      llm_compliance_failure_rate — HIT_EXACT audit failures. The prompt
-        was byte-identical to the one that produced the cached response;
-        a failure here is the LLM not following its own instruction, not
-        a cache error. This is the floor semantic matching can't beat —
-        even a perfect cache inherits the model's own non-compliance.
-      semantic_false_hit_rate — HIT_SEMANTIC audit failures. The cached
-        response doesn't satisfy the NEW prompt. This is a genuine false
-        hit, and the metric this whole project exists to measure.
-    Pooling them would attribute the model's own non-compliance to the
-    cache and inflate the semantic false-hit number.
+    # DECISION-V2: same Bearer-token auth as /v1/chat/completions
+    (resolve_tenant), scoped to WHERE tenant_id = $1 — not a separate
+    admin secret. This endpoint exposes spend/hit-rate/activity figures;
+    once deployed publicly those are per-tenant business data, not
+    something any caller should see for every tenant. A tenant can see
+    its own numbers (the same trust boundary chat_completions already
+    uses), nothing more.
     """
+    tenant_id = await resolve_tenant(authorization)
     rows = await pool().fetch(
         """SELECT decision,
                   count(*) FILTER (WHERE output_audit_ok IS NOT NULL) AS audited,
                   count(*) FILTER (WHERE output_audit_ok = false) AS failures
            FROM cache_decisions
-           WHERE decision IN ('HIT_EXACT', 'HIT_SEMANTIC')
-           GROUP BY decision"""
+           WHERE tenant_id = $1 AND decision IN ('HIT_EXACT', 'HIT_SEMANTIC')
+           GROUP BY decision""",
+        tenant_id,
     )
     by_decision = {r["decision"]: {"audited": r["audited"], "failures": r["failures"]} for r in rows}
 
@@ -216,16 +235,7 @@ async def chat_completions(
     # NOT logged to cache_decisions: tenant_id is NOT NULL there, and
     # there is no tenant to attribute the row to before this resolves.
     # -----------------------------------------------------------------
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="missing or malformed Authorization header")
-    api_key = authorization.removeprefix("Bearer ").strip()
-
-    tenant = await pool().fetchrow(
-        "SELECT id FROM tenants WHERE api_key_hash = $1", hash_api_key(api_key)
-    )
-    if tenant is None:
-        raise HTTPException(status_code=401, detail="unknown api key")
-    tenant_id = tenant["id"]
+    tenant_id = await resolve_tenant(authorization)
 
     messages = [m.model_dump() for m in req.messages]
     prompt_raw = json.dumps(messages)
