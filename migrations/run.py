@@ -1,5 +1,11 @@
-import asyncio, asyncpg, os, pathlib
-from dotenv import load_dotenv; load_dotenv()
+import asyncio
+import os
+import pathlib
+
+import asyncpg
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 async def main():

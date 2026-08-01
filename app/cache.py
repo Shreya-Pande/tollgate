@@ -6,7 +6,7 @@ eval/ scripts — same code path, so eval measures what production runs.
 import json
 import re
 
-from app.constraints import compatible, extract
+from app.constraints import compatible
 
 
 def constraints_to_json(c: dict) -> dict:

@@ -1,5 +1,8 @@
 .venv/
 .venv-gptcache/
+.venv-prodcheck/
+gptcache_bench_data/
+gptcache_smoke_data/
 __pycache__/
 *.pyc
 *.pyo

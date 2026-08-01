@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      FASTEMBED_CACHE_PATH: /tmp/fastembed-cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dev dependencies
+        run: pip install -r requirements/dev.txt
+
+      - name: Run migrations against CI Postgres
+        run: python migrations/run.py
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest -v
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t tollgate:ci .
+
+  eval-gate:
+    runs-on: ubuntu-latest
+    env:
+      # Not actually connected to for this job — ci_eval_gate.py loads a
+      # frozen .npz and never calls init_pool(). Settings() just needs the
+      # required fields present at import time.
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install eval dependencies
+        run: pip install -r requirements/eval.txt
+
+      - name: Run eval gate (AUC must not regress > 0.02 vs frozen baseline)
+        run: python eval/ci_eval_gate.py

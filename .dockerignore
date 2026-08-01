@@ -1,0 +1,17 @@
+.env
+.venv/
+.venv-gptcache/
+.venv-prodcheck/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+data/
+eval/
+tests/
+.git/
+.github/
+numbers.md
+README.md
+TOLLGATE.md
+PHASES.md

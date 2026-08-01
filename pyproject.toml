@@ -1,0 +1,15 @@
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# DECISION-V2: pin to ruff's classic E4/E7/E9/F set (pycodestyle errors +
+# pyflakes) rather than this ruff version's much broader shipped default
+# (SIM/RUF/FURB/BLE/I among others, discovered when "ruff check ." first
+# ran with no config: 60 findings, mostly style opinions, plus 27
+# now-"unused" noqa's because the broader set doesn't need E402 suppressed
+# the way it's used here). Correctness-only was always the intent — the
+# E402 noqa's scattered through app/main.py, eval/*.py, scripts/*.py exist
+# specifically for the load_dotenv()-before-import pattern, not as an
+# oversight. Pinning explicitly also means the CI gate doesn't silently
+# get stricter on a ruff version bump.
+select = ["E4", "E7", "E9", "F"]

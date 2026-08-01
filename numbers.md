@@ -23,7 +23,57 @@ gemini-2.5-flash-lite both now 404 "no longer available to new users" on
 this key, despite being listed in `/models`), but at least it won't change
 which model is being paid for without anyone noticing.
 
-## Dominated region (headline finding — README leads with this)
+## Headline reframe (set 2026-08-03, corrected same day — supersedes the earlier framing below)
+
+**Correction to the record:** the first version of this section recommended
+"MiniLM + gate" as the best configuration, reasoning that the smaller model
+paired with the gate beat BGE alone (0.940 vs 0.914) *and* embedded faster.
+The latency half of that was wrong — re-measured back-to-back on identical
+hardware, BGE embeds in 35.3ms vs MiniLM's 58.3ms fresh / 62.2ms original
+(BGE is *faster*, confirmed twice, not a fluke). That correction changes
+the recommendation: **BGE is not dominated on any axis** — it's more
+accurate cosine-only (0.914 vs 0.700) *and* faster to embed than MiniLM.
+There's no case for MiniLM+gate over BGE+gate once both numbers are right.
+
+**Best configuration, by this project's own data: BGE + gate.**
+
+    BGE (110M params) alone     = 0.914
+    BGE (110M params) + gate    = 0.992
+
+The gate adds real value on top of the strongest embedding model tested,
+at negligible cost (+0.078 AUC for ~0.03ms). It is not a fallback for a
+weak model — it's a cheap addition on top of a strong one.
+
+**How much the gate adds depends heavily on the base model** — +0.240 AUC
+on MiniLM (0.700→0.940) vs +0.078 on BGE (0.914→0.992), roughly a 3x
+difference in marginal contribution between two embedding models. That
+gap is itself the argument for measuring the gate's contribution against
+whatever embedding model is actually in use, rather than assuming a fixed
+benefit — a claim like "the gate adds ~0.2 AUC" would already be wrong for
+the second model tested. Two points don't establish a trend line, but if
+it continues with even stronger embedding models, a lexical gate like
+this one could eventually become redundant for this specific failure
+mode. Saying that out loud is the honest extrapolation, not a weakness to
+hide.
+
+**The latency inversion (BGE faster than MiniLM) has a hypothesis, not a
+proof.** fastembed ships pre-exported ONNX per architecture; BGE-base's
+export is plausibly better quantized/operator-fused than MiniLM's,
+independent of parameter count. Not verified — this is "I measured
+something that contradicted my expectation, re-measured to confirm it
+wasn't a fluke, and I have an untested guess why," stated as exactly
+that, not dressed up as a finding.
+
+**The cleanest single number in the project stays the operating-point
+result, unchanged by any of this:** at tau=0.95, gating drops FPR from
+**0.505 to 0.109** while TPR stays exactly **0.753** — the gate removes
+false hits at zero cost to true positives. (Measured on MiniLM; the
+same-shape result — TPR held, FPR cut — is expected to hold on BGE too
+given BGE's own gated ROC B numbers, though the exact FPR/TPR pair at
+tau=0.95 hasn't been separately pulled for BGE.) See "False-hit rate at
+operating point" and "Hit rate" below.
+
+## Dominated region
 
 - 2026-08-01, Phase 7, model=MiniLM, cosine-only, at **tau=0.95** (the
   config default): only **21.8%** of genuine paraphrases (P1, QQP) would be
@@ -106,7 +156,11 @@ which model is being paid for without anyone noticing.
     cache hit anything at all"): at tau=0.90, 42.5% of genuine paraphrases would be admitted; at tau=0.95 (current
     config default), 21.8%; at tau=0.99, 3.8%. mean sim=0.864, median=0.880.
 
-- **2026-08-02, Phase 8, gated (app/constraints.py wired in), both models:**
+- **2026-08-02, Phase 8, gated (app/constraints.py wired in), both models —
+  see "Headline reframe" at the top of this file for how to read the ROC B
+  row: MiniLM+gate (0.940) vs BGE-alone (0.914) is the real comparison, not
+  MiniLM cosine-only (0.700) vs MiniLM+gate, which overstates what the gate
+  contributes once a stronger embedding model is on the table.**
 
   | ROC | model | cosine-only | gated |
   |---|---|---|---|
@@ -192,24 +246,113 @@ which model is being paid for without anyone noticing.
 
 ## GPTCache default false-hit rate
 
+- 2026-08-04, Phase 9, `.venv-gptcache` (separate venv, `transformers<5` pinned
+  — 0.1.44 calls the deprecated `tokenizer.encode_plus()`, removed in
+  transformers 5.x), pure defaults (`Config()`, no threshold override):
+  embedding = `Onnx()` (`GPTCache/paraphrase-albert-onnx`), eval =
+  `SearchDistanceEvaluation()` (max_distance=4.0), `similarity_threshold=0.8`,
+  sqlite+faiss data manager. Same eval pairs this project uses for its own
+  ROC A/B (`data/gptcache_eval_pairs.parquet`, n=2300: P2=400, P2_control=400,
+  P3=1200, P3_control=300), each pair run through a fresh `put`+`get` in its
+  own uniquely-named data dir (`pair_{idx}`) to avoid a Windows
+  `shutil.rmtree` file-lock race that produced a degenerate first run — see
+  below.
+- This is a single hit/miss DECISION at GPTCache's own default threshold, not
+  a sweep — there's no equivalent of this project's ROC curve for GPTCache
+  since `Config().similarity_threshold` was left untouched, matching the
+  brief ("report the number for GPTCache's defaults").
+
+**Result: 2300/2300 pairs hit (100%), no variation by population or family.**
+
+  | population   | n    | safe_to_reuse | gptcache_hit |
+  |--------------|------|----------------|--------------|
+  | P2           | 400  | False          | 100%         |
+  | P2_control   | 400  | True           | 100%         |
+  | P3           | 1200 | False          | 100%         |
+  | P3_control   | 300  | True           | 100%         |
+
+  P3 by family (all 8, all n=150): entity, format, language, negation,
+  numeric, polarity, register, temporal — every one 100%.
+
+- Read as this project's ROC A / ROC B analogs (single operating point, GPTCache's default,
+  not swept): **TPR=1.0, FPR=1.0** on both. GPTCache's default config
+  exercises zero discrimination on this project's adversarial hard-negative
+  set — it hits on every constraint-violating near-duplicate exactly as often
+  as it hits on every genuinely-safe one.
+- **Flagging, not celebrating:** this is not "GPTCache is bad" — it's that its
+  default `similarity_threshold=0.8` (cosine distance path via
+  `SearchDistanceEvaluation`) is calibrated for typical paraphrase reuse, not
+  for the kind of adversarially-constructed near-duplicate-but-incompatible
+  pairs this project's P2/P3 populations deliberately contain (single-word
+  swaps that flip a count, a negation, a language, an entity). A smoke test
+  with a wildly unrelated pair (`gptcache_smoke.py`: "What is a hash map?" vs
+  "...gardening?") correctly returns a miss, confirming the cache isn't
+  simply broken — its notion of "similar enough" is just far looser than what
+  a constraint gate catches.
+- **Root-caused, not assumed:** the first full run (~95 min) showed the same
+  100% hit rate, which was initially suspected to be a Windows
+  `shutil.rmtree(..., ignore_errors=True)` bug leaking cache state across
+  pairs sharing one data dir. Fixed (unique dir per pair) and re-run in full
+  — the 100% figure above is from the corrected run and did not change,
+  confirming it's a real property of the default config on this data, not
+  the file-lock bug.
+- **This is the headline comparison for the prior-work section:** this
+  project's own gated MiniLM ROC B (all-8) reaches AUC 0.940 with a real
+  FPR/TPR tradeoff curve to choose an operating point from (e.g. FPR 0.109 at
+  TPR 0.753); GPTCache's default has no such curve to offer here — at its own
+  out-of-the-box setting it doesn't reject anything in this set at all.
+
 ## p50/p99 — hit path
 
-- 2026-08-01, local dev (network-bound to Neon ap-southeast-1), n=1 (Phase 7 will
-  give real percentiles): HIT_EXACT total_ms = 486ms, vs 8291ms for the miss
-  it was cached from — embed_ms/upstream_ms both NULL, as designed (skipped
-  entirely on the exact-match path).
+- 2026-08-03, Phase 9 (Task 3), local dev (network-bound to Neon
+  ap-southeast-1), via `percentile_cont` over the real decision log:
+  - HIT_EXACT: n=67, **p50=472ms, p99=612ms**
+  - HIT_SEMANTIC: n=2 (too small for a real percentile — both values:
+    708ms, 713ms), a firmer number needs more live traffic than this
+    project's quota allowed (Phase 8's live verification + this session)
+  - Superseded: the original n=1 Phase 7 placeholder (486ms) is consistent
+    with the real p50 above, not contradicted by it.
 
 ## p50/p99 — miss path
 
-- 2026-08-01, local dev (network-bound to Neon ap-southeast-1), n=2:
-  MISS_NO_CANDIDATE total_ms = 8291ms (first, in-process cold embed) and
-  4460ms (second, warm embed) — dominated by upstream_ms (3983ms / 3686ms),
-  i.e. Gemini's own response latency, not this app's overhead.
+- 2026-08-03, Phase 9 (Task 3), same method:
+  - MISS_NO_CANDIDATE: n=23, **p50=3654ms, p99=11940ms** — the p99 tail is
+    real Gemini upstream latency variance, not this app's overhead (see
+    upstream_ms below)
+  - MISS_UPSTREAM_ERROR: n=115, p50=1876ms, p99=2788ms (mostly the
+    ~150-request-burst rate-limit period from Phase 7's Task 6 replay —
+    fails fast relative to a real miss since no response body to wait for)
+  - MISS_GATE / MISS_LOW_SIM: n=1 each, single real data points from Task 2
+    live verification (2330ms, 3124ms) — not enough for a percentile, kept
+    for the record since they're genuine, not synthetic
+
+- **mean embed_ms/search_ms/gate_ms/upstream_ms across all logged decisions:**
+  embed_ms=133.4ms (n=142, pulled up by a few cold-start requests — see the
+  899ms-vs-112ms cold/warm note above), search_ms=198.0ms (n=7, small — the
+  semantic path is still lightly exercised), gate_ms=0.0139ms (n=7,
+  consistent with the standalone 0.030ms/1000-call measurement — the gate
+  is not a meaningful cost in the request path regardless of sample size),
+  upstream_ms=1473.2ms (n=140, dominates every miss's total_ms by a wide
+  margin — this app's own overhead is small next to Gemini's response
+  time).
 
 ## embed / search / gate ms
 
 - 2026-08-01, local dev (Intel Core i3-1005G1 @ 1.20GHz, CPU-only ONNX via fastembed):
   embed (single-text, post-warmup mean over 100 encodes) = 62.17ms, dim=384, norm=1.0
+- 2026-08-03, same method, same hardware, second embedding model
+  (BAAI/bge-base-en-v1.5, 110M params, 768-dim) = **35.31ms**, dim=768,
+  norm=1.0. Re-measured MiniLM fresh immediately afterward for a fair
+  back-to-back comparison (not the 2026-08-01 figure re-quoted, in case
+  session/warm-up state differed): **58.30ms** — consistent with the
+  original figure, confirming BGE is genuinely faster here, not a fluke.
+  **This is the opposite of the intuitive "bigger model = slower"
+  assumption** and wasn't fully root-caused: fastembed ships pre-exported
+  ONNX per architecture, and BGE-base's export is plausibly better
+  quantized/operator-fused than MiniLM's, independent of parameter count.
+  Reported as measured, not explained away — see numbers.md's headline
+  reframe and README for how this changes (and doesn't change) the
+  MiniLM+gate vs BGE-alone argument.
 - 2026-08-01, local dev, in-process via the running FastAPI server (not the
   standalone smoke test above) — same model, module-level singleton loaded
   at import time, but still shows real first-call vs warm variance:
