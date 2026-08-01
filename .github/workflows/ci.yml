@@ -44,7 +44,14 @@ jobs:
         run: ruff check .
 
       - name: Test
-        run: pytest -v
+        run: |
+          set +e
+          pytest -v --tb=long > /tmp/pytest_out.txt 2>&1
+          code=$?
+          tail -n 80 /tmp/pytest_out.txt | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
+          exit $code
 
   build:
     runs-on: ubuntu-latest
