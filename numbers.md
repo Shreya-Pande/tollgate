@@ -2,6 +2,13 @@
 
 Updated daily from Day 1 (TOLLGATE.md §15). Values filled in as measured — none yet.
 
+**Standing constraint (set 2026-08-01): no paid models or paid APIs — free
+tiers and local models only.** Relevant to Phase 8: TOLLGATE.md §8 calls for
+a frontier API embedding model as the second model in the two-model sweep.
+That's out under this constraint. The second model will be either Gemini's
+free embedding API or a larger local fastembed model (e.g.
+BAAI/bge-base-en-v1.5) — decide when Phase 8 is reached.
+
 ## Exact vs semantic hit split
 
 ## Hit rate
@@ -48,6 +55,11 @@ Updated daily from Day 1 (TOLLGATE.md §15). Values filled in as measured — no
 ## LLM-gate latency and cost (rejected alternative)
 
 ## Cost per 1,000 requests — cached vs uncached
+
+- 2026-08-01: total API spend for this project to date = **$0** — running
+  entirely on Gemini's free tier (gemini-flash-latest). A real result, not a
+  placeholder: it's the reason the standing constraint above exists, and
+  worth keeping true through Phase 10.
 
 ## Corpus size at measurement
 
