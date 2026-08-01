@@ -1,148 +1,431 @@
 # Tollgate
 
-Full report structure (§13) is Phase 10 work. This file currently holds two
-sections written early, out of order, because the numbers they depend on
-were freshly measured: the headline result, and the rejected LLM-as-gate
-alternative.
+An OpenAI-compatible LLM semantic-cache gateway (FastAPI, PostgreSQL/pgvector,
+Docker, CI) whose cache admission decision is evaluated as a binary
+classifier, not assumed to be correct because the cosine similarity is high.
 
-## The headline result: the gate adds value on top of the strongest model tested
+Full numbers, with dates and sample sizes, live in [numbers.md](numbers.md).
+Anything stated here without a number attached is an opinion, not a result —
+check numbers.md before trusting a specific figure quoted from memory.
 
-*Corrected same day.* An earlier version of this section recommended
-"MiniLM + gate" over BGE alone, reasoning that the smaller model paired
-with the gate won on accuracy (0.940 vs 0.914) *and* embedded faster. The
-latency claim was wrong — re-measured back-to-back on identical hardware,
-BGE embeds in 35.3ms vs MiniLM's 58.3ms (BGE is faster, confirmed twice).
-That changes the conclusion: **BGE isn't dominated on any axis** — more
-accurate cosine-only *and* faster to embed than MiniLM. There's no case
-for the smaller model once both numbers are right, so the recommendation
-changes too.
+## 1. The question
 
-| | ROC B, ungated, cosine-only | single-text embed latency |
-|---|---|---|
-| MiniLM (22M params) | 0.700 | 58-62ms |
-| BAAI/bge-base-en-v1.5 (110M params) | **0.914** | **35.3ms** |
+How often does a semantic cache serve a wrong answer, and how would you
+know? Semantic caches ship with a default similarity threshold and, in most
+cases, no way to answer that question at all — the threshold is a knob
+someone picked, not a number anyone measured.
 
-**Best configuration, by this project's own data: BGE + gate.**
+## 2. Why it isn't observable
 
-    BGE (110M params) alone   = 0.914
-    BGE (110M params) + gate  = 0.992
+A false hit returns HTTP 200 with a fluent, plausible-looking answer. There
+is no exception, no malformed response, nothing that shows up in an error
+dashboard. The cached response to "explain recursion in 3 bullet points" and
+to "explain recursion in 10 bullet points" can both look like a completely
+reasonable answer to *someone's* question — just not the one that was asked.
+Without ground truth on every request, this failure mode is invisible by
+construction.
 
-The gate adds real value on top of the strongest embedding model tested,
-at negligible cost (+0.078 AUC for ~0.03ms) — it's not a fallback for a
-weak model, it's a cheap addition on top of a strong one.
+The signal has to be manufactured: build pairs of prompts with a *known*
+ground-truth label (would reusing A's cached response for B be safe, or
+not?), and measure how well cosine similarity — and then a constraint filter
+on top of it — recovers that label.
 
-**How much it adds depends heavily on the base model** — +0.240 AUC on
-MiniLM (0.700→0.940) vs +0.078 on BGE (0.914→0.992), roughly a 3x
-difference in marginal contribution between two embedding models. That
-gap is itself the argument for *measuring* the gate's contribution
-against whatever embedding model is actually deployed, rather than
-assuming a fixed benefit — "the gate adds ~0.2 AUC" was already wrong by
-the second model tested. Two points don't establish a trend line, but if
-it continues with stronger embeddings, a lexical gate like this one could
-eventually become redundant for this specific failure mode. That's the
-honest extrapolation, not a weakness to hide — a project that only shows
-the case where its own contribution looks largest is less credible than
-one that shows the trend working against it.
+## 3. Method
 
-**The latency inversion has a hypothesis, not a proof.** fastembed ships
-pre-exported ONNX per architecture; BGE-base's export is plausibly better
-quantized/operator-fused than MiniLM's, independent of parameter count —
-not verified. This is "I measured something that contradicted my
-expectation, re-measured to confirm it wasn't a fluke, and I have an
-untested guess why," stated as exactly that.
+Four populations, 2700 pairs total ([numbers.md, "Corpus size at
+measurement"](numbers.md)):
 
-**The cleanest single number in the project, unaffected by any of the
-above:** at the operating threshold (tau=0.95), gating drops the false
-positive rate from **0.505 to 0.109** while the true positive rate stays
-exactly **0.753** — the gate removes false hits at zero cost to true
-positives (measured on MiniLM; BGE's gated ROC B numbers point the same
-direction but the FPR/TPR pair at tau=0.95 specifically wasn't pulled for
-BGE separately). See numbers.md, "Hit rate" and "False-hit rate at
-operating point."
+| Population | n | Source | What it tests |
+|---|---|---|---|
+| P1 | 400 | QQP (genuine duplicate questions) | Admission rate on real paraphrases — no matched negative, reported as a single number |
+| P2 / P2_control | 400 / 400 | PAWS (word-scrambled, meaning-flipped vs meaning-preserving) | ROC A — near-identical wording, different meaning |
+| P3 / P3_control | 1200 / 300 | Dolly instructions, programmatically perturbed across 8 families vs reworded-but-equivalent | ROC B — the project's headline metric |
 
-## Prior work: how this compares to GPTCache's defaults
+**Provenance matters here specifically because of the proxy-label problem**
+(§9.4 below): QQP and PAWS give real human-labeled pairs, but they're
+sentence pairs, not instruction pairs, and their negatives (PAWS) are a
+different kind of "similar but wrong" than what an LLM-gateway constraint
+gate is meant to catch. P3 exists to close that gap — instructions are
+taken from Dolly (real, if clean, instruction-following data) and perturbed
+along 8 axes that constraint-based caching specifically cares about: count,
+negation, language, entities, format (**in-design** — the gate has an
+explicit rule for these), and register, temporal, polarity (**held-out** —
+deliberately *no* rule was written for these, so their detection rate
+measures generalization, not memorization of the rule set).
 
-*Placed here for now; will move into the full §13 "prior work" section.*
+**The proxy-label limitation, stated plainly:** a "paraphrase" label (QQP,
+PAWS) is a proxy for "safe to reuse the cached response," not the same
+thing. P3/P3_control's perturbation labels are a more direct proxy — but
+still programmatic, not organic traffic. See Limitations (§9).
 
-GPTCache (0.1.44) is the closest existing tool to this project — a semantic
-cache with a fixed similarity threshold and, out of the box, no compatibility
-gate. Benchmarked on this project's own eval pairs (n=2300: P2, P2_control,
-P3, P3_control — the same populations behind ROC A/B above), using
-`init_similar_cache()` with pure defaults (`Onnx()` embedding,
-`SearchDistanceEvaluation()`, `similarity_threshold=0.8`), no threshold
-tuning.
+**Split:** the 5 in-design families' perturbation rules were written first;
+the 3 held-out families were never looked at while writing
+`app/constraints.py`. Their detection rate in Result 2 is a genuine
+train/test split, not a resubstitution number.
 
-**Result: GPTCache hit on 2300/2300 pairs (100%) — every population, every
-perturbation family, no variation.** Read as a single operating point
-(GPTCache wasn't swept, matching its own out-of-the-box config): TPR=1.0,
-FPR=1.0. It exercises zero discrimination on this dataset — it hits on a
-constraint-violating near-duplicate exactly as often as a genuinely safe one.
+## 4. Result 1 — cosine-only ROC, two models, per population
 
-This isn't "GPTCache is broken" — a smoke test against a wildly unrelated
-pair correctly misses. It's that GPTCache's default threshold is calibrated
-for everyday paraphrase reuse, not for the adversarially-constructed
-near-duplicates this project's eval set exists to probe (a single swapped
-word that flips a count, a negation, a language, an entity — exactly the
-failure mode a cosine-only cache is structurally blind to). That's the
-project's own opening claim, demonstrated on someone else's tool rather than
-just argued in the abstract: **"semantic caches ship with a default
-threshold and no way to know how often they serve a wrong answer"** — on
-this dataset, GPTCache's default serves the wrong answer 100% of the time
-the underlying prompts differ in a way that matters. This project's own
-gated MiniLM reaches ROC B (all-8) AUC 0.940, with a real operating point
-(FPR 0.109 at TPR 0.753) to choose from — GPTCache's defaults offer no such
-curve because nothing in its default config rejects on constraint mismatch
-at all.
+([numbers.md, "AUC per model per population"](numbers.md))
 
-What's genuinely GPTCache's: the caching infrastructure itself (storage
-backends, eviction, multi-provider adapters) is more mature and complete
-than anything built here. What's being compared is narrower and specific —
-its default admission decision on this project's adversarial eval set, not
-the tool as a whole. See numbers.md, "GPTCache default false-hit rate" for
-the full breakdown and the Windows file-locking bug that produced a
-misleading first run (root-caused and fixed; the 100% figure survived the
-fix unchanged).
+| ROC | model | AUC | 95% CI |
+|---|---|---|---|
+| A (P2_control vs P2) | MiniLM (22M) | 0.634 | [0.598, 0.671] |
+| A (P2_control vs P2) | BGE-base (110M) | 0.641 | — |
+| B (P3_control vs P3, all 8) | MiniLM | 0.700 | [0.670, 0.735] |
+| B (P3_control vs P3, all 8) | BGE-base | 0.914 | — |
 
-## Why rules, not an LLM, for the constraint gate (§6)
+**The dominated region, stated as two directly comparable numbers instead
+of an abstract AUC gap:** at tau=0.95 (this project's config default), only
+**21.8%** of genuine paraphrases (P1, QQP) would be admitted, while PAWS's
+meaning-*flipped* pairs (P2) sit at a mean similarity of **0.962** —
+comfortably above 0.95, so they'd be *mostly admitted* at that same
+threshold. No cosine-only threshold gives an acceptable hit rate and an
+acceptable false-hit rate at once: raising tau to exclude PAWS's
+near-duplicates also excludes most genuine paraphrases; lowering it to keep
+genuine paraphrases lets most of PAWS's meaning-flipped pairs through too.
+This dominated region — not an abstract AUC number — is the reason the
+constraint gate exists.
 
-The obvious alternative to a regex-based constraint extractor is asking an
-LLM to judge compatibility directly: "do these two prompts require the same
-response?" It's more flexible than a fixed lexicon and doesn't need
-maintenance as new constraint types show up. It was tried and rejected —
-timed and costed against real numbers, not estimated.
+Per-family mean cosine similarity within P3 (MiniLM):  entity 0.806, format
+0.878, register 0.890, language 0.933, polarity 0.954, negation 0.966,
+temporal 0.980, numeric 0.985. **numeric and temporal sit at or above
+P3_control's own mean (0.967)** — cosine cannot distinguish "exactly 3" from
+"exactly 10," or "as of 2019" from "as of today," at all. temporal is one of
+the three held-out families; its Result 2 number should be read with that
+in mind before it's even discussed.
 
-**Method:** 8 real constraint checks through `gemini-3.5-flash-lite` (the
-same pinned model the project uses elsewhere), each posed as prompt-pair
-compatibility judgment, 2.5s apart. Compared against this project's own
-measured hit/miss economics from `cache_decisions` (67 `HIT_EXACT` + 2
-`HIT_SEMANTIC`, 25 real misses).
+## 5. Result 2 — the gate shifts the curve
+
+([numbers.md, "AUC per model per population, cosine-only and gated" and
+"In-design vs held-out vs P2 detection"](numbers.md))
+
+| ROC B | model | cosine-only | gated |
+|---|---|---|---|
+| all 8 | MiniLM | 0.700 | **0.940** |
+| all 8 | BGE-base | 0.914 | **0.992** |
+| in-design 5 only | MiniLM | 0.728 | 0.995 |
+| in-design 5 only | BGE-base | 0.910 | 0.997 |
+| held-out 3 only | MiniLM | 0.654 | 0.850 |
+| held-out 3 only | BGE-base | 0.920 | 0.983 |
+
+**Best configuration, by this project's own data: BGE + gate (0.992).** An
+earlier version of this section recommended MiniLM + gate, reasoning that
+the smaller model paired with the gate beat BGE alone (0.940 vs 0.914) *and*
+embedded faster. The latency half was wrong — re-measured back-to-back on
+identical hardware, BGE embeds in 35.3ms vs MiniLM's 58.3ms (BGE is faster,
+confirmed twice, not a fluke; see Result 8). BGE isn't dominated on any
+axis — more accurate cosine-only *and* faster to embed than MiniLM — so
+there's no case for the smaller model once both numbers are right.
+
+The gate adds real value on top of the strongest embedding model tested, at
+negligible cost (+0.078 AUC for ~0.03ms) — it is not a fallback for a weak
+model. **How much it adds depends heavily on the base model:** +0.240 AUC on
+MiniLM (0.700→0.940) vs +0.078 on BGE (0.914→0.992), roughly a 3x difference
+between two embedding models. That gap is itself the argument for
+*measuring* the gate's contribution against whatever embedding model is
+actually deployed, rather than assuming a fixed benefit — "the gate adds
+~0.2 AUC" was already wrong by the second model tested. If the trend
+continues with stronger embeddings, a lexical gate like this one could
+eventually become redundant for this specific failure mode — that's the
+honest extrapolation from two points, not a demonstrated trend.
+
+**Held-out generalization, three ways, never reported pooled:**
+in-design detection mean **97.9%** (numeric 100%, negation 96.0%, language
+100%, entity 100%, format 93.3%) vs held-out mean **33.1%** — but that mean
+is misleading. **register 0.0% and polarity 0.0%** are the honest held-out
+signal: genuinely uncaught, exactly as expected for constraint types with no
+rule and no lexical overlap with any of the 5 in-design dimensions.
+**temporal's 99.3% is verified NOT to be genuine generalization** — 149/150
+of its "detections" fire via the `entities` dimension catching a bare
+numeral ("2019" present on one side, absent on the other), not anything
+temporal-aware; it would not catch a no-digit temporal contrast
+("historically" vs "currently"). Wherever 97.9%/33.1% (or the held-out AUCs,
+0.850/0.983) appear elsewhere, this caveat travels with them.
+
+**ROC A gets *worse* under gating, on both models — flagged, not
+tuned away:** 0.634→0.599 (MiniLM), 0.641→0.607 (BGE). Root cause,
+investigated rather than assumed: the `entities` dimension drives 95.3% of
+all gate rejections on P2+P2_control, firing on 31.0% of the positives vs
+43.0% of the negatives — nearly symmetric, so it suppresses true positives
+about as often as it correctly catches true negatives. Concrete example:
+`"...actors from the Open Theater."` vs `"...actors from The Open
+Theatre."` — PAWS's word-scrambling moves "The" into/out of sentence-initial
+position, and "Theater"/"Theatre" is a spelling variant, not a real entity
+change. This is `entities` doing its job on text it was never designed for
+(adversarial word-scrambling, a different attack than constraint
+perturbation). **Deliberately not fixed** — tuning the gate to rescue this
+number would be overfitting to the eval set, the exact failure mode this
+project exists to catch elsewhere.
+
+**Why rules, not an LLM, for the constraint gate.** The obvious alternative
+is asking an LLM to judge prompt-pair compatibility directly — more
+flexible, no lexicon to maintain. Timed and costed against this project's
+own real hit/miss economics (67 `HIT_EXACT` + 2 `HIT_SEMANTIC`, 25 real
+misses, `cache_decisions`), not estimated:
 
 | | Measured |
 |---|---|
-| LLM-gate check: mean latency | 1508ms |
+| LLM-gate check (gemini-3.5-flash-lite): mean latency | 1508ms |
 | LLM-gate check: mean cost | 0.00289¢ |
-| Local rules-based gate (`app/constraints.py`): mean latency | 0.030ms (1000-call average) |
+| Local rules-based gate: mean latency (1000-call average) | 0.030ms |
 | Cache hit: mean latency | 486ms |
-| Cache miss (real upstream call): mean latency | 4018ms |
-| Cache miss: mean cost | 0.00531¢ |
-| **Latency a hit saves vs a miss** | **3532ms** |
-| **Cost a hit saves vs a miss** | **0.00531¢** |
+| Cache miss (real upstream call): mean latency / cost | 4018ms / 0.00531¢ |
 
-An LLM-gate check alone (1508ms, 0.00289¢) — before it even renders a
-verdict — **eats 42.7% of the latency saving and 54.4% of the cost saving**
-a cache hit exists to provide. The rules-based gate's own overhead
-(0.030ms) is statistically zero against either number.
+An LLM-gate check alone — before it renders a verdict — **eats 42.7% of the
+latency saving and 54.4% of the cost saving** a cache hit exists to
+provide; the rules-based gate's own overhead is statistically zero against
+either number. This is a *worse* ratio than a naive estimate suggests,
+precisely because this project's real `c_miss` is tiny (free-tier pricing) —
+an LLM-gate's own cost, on the same cheap model, consumes more than half an
+already-small savings pool. Side note, not the point of the measurement: the
+LLM-gate agreed with this project's own eval labels on all 8 sampled pairs —
+accuracy was never in question, the rejection is purely economic.
 
-This is a *worse* ratio than a naive estimate would suggest, precisely
-because this project's real `c_miss` is unusually small (free-tier
-`gemini-3.5-flash-lite` pricing, sub-cent per call) — the LLM-gate's own
-cost, using the same cheap model, ends up consuming *more* than half of an
-already-tiny savings pool. A judge call against a frontier model, or a
-workload with a more expensive upstream model, would make this worse, not
-better. The rules-based gate isn't "close enough" to justify on flexibility
-— it's cheaper by roughly five orders of magnitude in latency and doesn't
-carry its own error rate to evaluate on top of the cache's.
+## 6. Result 3 — GPTCache defaults on the same pairs
 
-Interesting side note, not the point of this measurement: the LLM-gate
-agreed with this project's own eval labels on all 8 sampled pairs. Accuracy
-was never in question here — the rejection is purely economic.
+([numbers.md, "GPTCache default false-hit rate"](numbers.md))
+
+GPTCache (0.1.44), benchmarked on this project's own eval pairs (n=2300:
+P2, P2_control, P3, P3_control), pure defaults (`Onnx()` embedding,
+`SearchDistanceEvaluation()`, `similarity_threshold=0.8`) — no threshold
+tuning, matching the brief of reporting GPTCache's *defaults*, not a swept
+best case.
+
+**Result: 2300/2300 pairs hit (100%) — every population, every
+perturbation family, no variation.** Read as this project's own ROC A/B
+operating point (single decision, not swept): **TPR=1.0, FPR=1.0**. Zero
+discrimination between safe and unsafe reuse on this adversarial set — it
+hits on a constraint-violating near-duplicate exactly as often as a
+genuinely safe one.
+
+Not "GPTCache is broken": a smoke test with a wildly unrelated pair
+correctly misses. Its default threshold is calibrated for everyday
+paraphrase reuse, not the adversarially-constructed near-duplicates this
+project's eval set exists to probe (a single swapped word that flips a
+count, a negation, a language, an entity). That's this project's opening
+claim, demonstrated on someone else's tool instead of just argued in the
+abstract.
+
+**Root-caused, not assumed:** the first full run showed the same 100% hit
+rate, initially suspected to be a Windows `shutil.rmtree` file-lock bug
+leaking state across pairs. Fixed (unique data directory per pair) and
+re-run in full — the figure did not change, confirming it's a real property
+of the default config on this data.
+
+This project's own gated MiniLM ROC B reaches AUC 0.940 with a real
+FPR/TPR tradeoff curve to pick an operating point from (§7); GPTCache's
+defaults offer no such curve here — at its own out-of-the-box setting it
+doesn't reject anything in this set at all.
+
+## 7. Choosing an operating point
+
+([numbers.md, "τ\* surface over (ρ, C/c_miss)" and "False-hit rate at
+operating point"](numbers.md), `eval/cost_model.py`, `eval/figures/tau_star.png`)
+
+The optimal threshold tau\* depends on two things this project doesn't get
+to assume: rho (the real workload's rate of genuine reusable near-dups —
+supplied, never taken from the eval set's own base rate, since P3/P3_control
+are deliberately adversarial-heavy) and C/c_miss (the cost of a false hit
+relative to the cost of a real miss). Computed over a grid of both, using
+this project's real measured `c_miss` = 0.0053¢ (mean of 25 real misses):
+
+**Because c_miss is real and tiny (free-tier pricing), tau\* saturates at
+1.0 for C/c_miss above roughly 0.2–0.3, regardless of rho** — i.e. for any
+false-hit cost even a few tenths of a real miss's cost, the cost-optimal
+policy is "don't admit anything semantically, exact-match only." The
+transition zone (C/c_miss ≈ 0.001–0.3) shows tau\* dropping from 1.0 to
+~0.70–0.81 depending on rho — higher rho tolerates a lower tau\* at the same
+cost ratio, since more of what gets admitted is a real win. Representative
+values: at C/c_miss=1 (a false hit costs the same as a miss), tau\*=0.70–0.73
+across all three rho tested; at C/c_miss=10, tau\*=0.98–1.00.
+
+**This is a genuine, somewhat counterintuitive output of the model, not a
+tuning choice: for a workload this cheap to serve on a cache miss, the
+economically honest answer is often "don't cache this" once a false hit has
+any real cost attached** — the savings from a hit are small in absolute
+terms (sub-cent), so it doesn't take much false-hit cost to erase them. This
+result should NOT be read as "no semantic caching is ever worth it" —
+it's specific to this project's actual, unusually cheap upstream (free-tier
+`gemini-3.5-flash-lite`); a workload with an expensive upstream model would
+shift the whole curve.
+
+**The operating point actually configured** (tau=0.95, MiniLM+gate): gating
+drops the false positive rate from **0.505 to 0.109** while the true
+positive rate stays exactly **0.753** — same hit rate, less than a quarter
+of the false-hit rate. The same-shape result is expected to hold for BGE
+given its own gated ROC B numbers, though the exact FPR/TPR pair at
+tau=0.95 wasn't separately pulled for BGE.
+
+## 8. Latency and cost, measured, hardware labelled
+
+([numbers.md, "embed / search / gate ms", "p50/p99 — hit/miss path",
+"LLM-gate latency and cost"](numbers.md))
+
+**Hardware: Intel Core i3-1005G1 @ 1.20GHz, CPU-only ONNX (fastembed), local
+dev, network-bound to Neon (ap-southeast-1).** A deployed-instance
+measurement, same region as the database, is planned but not yet available
+as of this writing — see §10 (setup) for status; local-dev numbers below are
+network-bound and not the number that belongs in a resume bullet.
+
+| Stage | Mean |
+|---|---|
+| Embed (MiniLM, single-text, post-warmup) | 58.3–62.2ms |
+| Embed (BGE-base, single-text, post-warmup) | **35.3ms** |
+| Embed, cold start (first request after server boot) | 899ms |
+| Embed, warm (second request) | 112ms |
+| Search (cosine scan, n=7 samples — small) | 198.0ms |
+| Constraint gate (`app/constraints.py`, 1000-call average) | 0.030ms |
+| Upstream call (mean across all logged misses, n=140) | 1473.2ms |
+
+| Path | p50 | p99 | n |
+|---|---|---|---|
+| HIT_EXACT | 472ms | 612ms | 67 |
+| HIT_SEMANTIC | 708–713ms (too small for a percentile) | — | 2 |
+| MISS_NO_CANDIDATE | 3654ms | 11940ms (real Gemini variance) | 23 |
+| MISS_UPSTREAM_ERROR | 1876ms | 2788ms | 115 (mostly one rate-limited burst) |
+
+**Cost: $0 total project spend to date** — running entirely on Gemini's
+free tier (`gemini-3.5-flash-lite`, pinned; see numbers.md for why not the
+`-latest` alias). This is why the LLM-gate alternative (§5) looks as bad as
+it does: with `c_miss` this small, an LLM-based gate check costs more,
+relatively, than it would against an expensive frontier model.
+
+## 9. Limitations
+
+Named here deliberately, before a reviewer finds them:
+
+1. **Real prompts are messier than Dolly.** The constraint extractor's
+   recall on organic production traffic is unknown, and probably lower than
+   on the clean, single-instruction Dolly prompts P3 is built from. There
+   was no cheap way to measure this given the project's time and quota
+   budget.
+2. **`safe_to_reuse` may not be transitive.** A matches B and B matches C
+   without A being safe for C. This project measures pairs; a real cache
+   operates on a growing set where transitivity isn't guaranteed. No answer
+   to this within scope.
+3. **The exact-match path may be doing most of the work.** An early live
+   replay (200 requests, Zipf-weighted repetition, no semantic layer built
+   yet) found exact-match alone resolved **75.9%** of successfully-processed
+   requests (66/87). If exact matching captures most of the achievable
+   savings in a real workload, the semantic layer — and everything this
+   project measures about it — carries all of the correctness risk for a
+   comparatively small share of the benefit. Small n; a firmer number needs
+   more live traffic than this project's LLM quota allowed.
+4. **Proxy labels.** A paraphrase label (QQP/PAWS) is a proxy for
+   "safe to reuse," not the same thing — sentence pairs, not prompt pairs.
+   This is exactly why P3/P3_control exist, and why every population is
+   reported separately rather than pooled into one number.
+5. **The gate makes ROC A worse, not better** (§5) — a real, measured cost
+   on a metric outside the gate's design scope, left unfixed on purpose to
+   avoid overfitting the eval set.
+6. **Held-out generalization is genuinely 0% on two of three families**
+   (register, polarity) — the gate has no coverage at all for constraint
+   types with no lexical overlap to its 5 in-design dimensions. The third
+   held-out family's apparent 99.3% detection is a numeral-matching
+   artifact (§5), not real generalization — the honest held-out number is
+   closer to 0% than to 33%.
+7. **Generation/label-quality validation was never run.** A planned 100-pair
+   manual/LLM validation of P3's programmatically-perturbed prompts (do the
+   perturbations actually produce sensible instructions with the intended
+   label?) did not happen — cut for LLM quota, not because it was judged
+   unnecessary. Noted here rather than silently dropped from numbers.md.
+8. **Several numbers rest on very small samples**, flagged inline wherever
+   used: `HIT_SEMANTIC` latency (n=2), `search_ms`/`gate_ms` in the live
+   decision log (n=7), `MISS_GATE`/`MISS_LOW_SIM` latency (n=1 each). These
+   are kept because they're genuine measurements, not because they're
+   statistically solid.
+
+## 10. Prior work
+
+**GPTCache** is the closest existing tool to this project, and the one
+directly benchmarked (§6): a semantic cache with a fixed similarity
+threshold and, out of the box, no compatibility gate. Its caching
+infrastructure — storage backends, eviction, multi-provider adapters — is
+more mature and complete than anything built here; what's compared is
+narrower and specific: its default admission decision on this project's
+adversarial eval set, where it shows zero discrimination (100% hit rate,
+§6). Everything else here — the binary-classifier evaluation methodology
+(ROC/AUC/CI over labeled pairs), the held-out-family generalization test,
+the score-transform trick that makes a hybrid rule+threshold admission rule
+representable as one ROC axis, the output-constraint audit as a continuous
+production lower bound, and the measured GPTCache-defaults number itself —
+is this project's own contribution, not GPTCache's.
+
+**LiteLLM** is a general-purpose LLM proxy/router that also offers an
+optional caching layer (including semantic-caching backends). Its scope is
+provider abstraction, routing, and observability across many upstream
+models — caching-correctness measurement of the kind this project does
+isn't its focus. No benchmark of LiteLLM's cache was run here; it's
+mentioned for completeness of the landscape, not compared numerically.
+
+**SAFE-CACHE** and **category-aware caching** are both research directions
+in the semantic-caching literature that share this project's core
+instinct — that raw cosine similarity is an insufficient admission signal
+and needs a second check before serving a cached response, whether a
+safety/consistency check on top of similarity (SAFE-CACHE) or conditioning
+admission on an inferred category/intent rather than embedding distance
+alone (category-aware caching). This project's constraint gate is a
+lexical, rule-based version of that same idea, evaluated with an explicit
+held-out generalization test. Their specific reported numbers were not
+independently reproduced in this project — stated here at the level of
+general approach, not as a verified comparison, since doing so honestly
+would require reading and re-running their original evaluations, which was
+out of scope for this project's time budget.
+
+## 11. Setup
+
+**Requirements:** Python 3.12, a Postgres database with the `pgvector`
+extension (this project runs against Neon, ap-southeast-1), and either a
+local venv or Docker.
+
+```bash
+python -m venv .venv
+.venv/Scripts/activate       # .venv/bin/activate on Linux/macOS
+pip install -r requirements/dev.txt
+```
+
+**Environment** (`.env`, see `.env.example`): `DATABASE_URL`,
+`EMBEDDING_MODEL`, `UPSTREAM_API_KEY`, `UPSTREAM_BASE_URL`,
+`FASTEMBED_CACHE_PATH`. No secrets are committed — `.env` is gitignored.
+
+**Migrations:**
+
+```bash
+python migrations/run.py
+```
+
+**Run the service:**
+
+```bash
+uvicorn app.main:app --reload
+```
+
+**Run tests:** `pytest -v` (21 tests; `tests/test_tenant_isolation.py`
+needs a real `DATABASE_URL`, everything else is offline).
+
+**Run the eval sweep** (regenerates the ROC/AUC figures in
+`eval/figures/`, not committed — see `.gitignore`):
+
+```bash
+python eval/run_sweep.py
+```
+
+**Docker:** `docker build -t tollgate .` — multi-stage build, the fastembed
+model is baked into the image at build time so the first real request
+doesn't pay a download. Not locally build-tested (Docker isn't installed in
+this project's dev environment) — validated by the `build` job in
+`.github/workflows/ci.yml` instead.
+
+**CI** (`.github/workflows/ci.yml`): three jobs — `lint-test` (ruff +
+pytest against a `pgvector/pgvector:pg16` service container), `build`
+(`docker build`), and `eval-gate` (`eval/ci_eval_gate.py` — asserts the
+gated AUC on a frozen 194-pair subset doesn't regress more than 0.02 from a
+committed baseline; no model download, no API calls, ~30s). The frozen
+subset is regenerated manually via `scripts/freeze_ci_subset.py` when
+`eval_pairs` changes enough to warrant a new baseline — not run by CI
+itself.
+
+**Deployment:** not yet live as of this writing. Planned target is a
+free-tier host in the same region as Neon (ap-southeast-1) to keep the
+latency numbers in §8 meaningful; this README will be updated with a
+deployed-instance latency row once that happens.

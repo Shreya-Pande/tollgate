@@ -162,16 +162,22 @@ operating point" and "Hit rate" below.
   MiniLM cosine-only (0.700) vs MiniLM+gate, which overstates what the gate
   contributes once a stronger embedding model is on the table.**
 
-  | ROC | model | cosine-only | gated |
+  | ROC | model | cosine-only (95% CI) | gated (95% CI) |
   |---|---|---|---|
-  | A (P2_control vs P2) | minilm | 0.634 | **0.599** (down) |
-  | A (P2_control vs P2) | bge | 0.641 | **0.607** (down) |
-  | B all 8 (P3_control vs P3) | minilm | 0.700 | **0.940** |
-  | B all 8 (P3_control vs P3) | bge | 0.914 | **0.992** |
-  | B in-design 5 only | minilm | 0.728 | 0.995 |
-  | B in-design 5 only | bge | 0.910 | 0.997 |
-  | B held-out 3 only | minilm | 0.654 | 0.850 |
-  | B held-out 3 only | bge | 0.920 | 0.983 |
+  | A (P2_control vs P2) | minilm | 0.634 [0.598, 0.671] | **0.599** (down) [0.563, 0.639] |
+  | A (P2_control vs P2) | bge | 0.641 [0.604, 0.680] | **0.607** (down) [0.572, 0.648] |
+  | B all 8 (P3_control vs P3) | minilm | 0.700 [0.670, 0.730] | **0.940** [0.929, 0.952] |
+  | B all 8 (P3_control vs P3) | bge | 0.914 [0.897, 0.930] | **0.992** [0.988, 0.995] |
+  | B in-design 5 only | minilm | 0.728 [0.697, 0.759] | 0.995 [0.992, 0.998] |
+  | B in-design 5 only | bge | 0.910 [0.890, 0.927] | 0.997 [0.995, 0.999] |
+  | B held-out 3 only | minilm | 0.654 [0.613, 0.696] | 0.850 [0.822, 0.874] |
+  | B held-out 3 only | bge | 0.920 [0.900, 0.940] | 0.983 [0.975, 0.990] |
+
+  (2026-08-04, re-ran `eval/run_sweep.py` against the already-built embed
+  cache — no new embeddings, no API calls — specifically to recover the
+  gated-AUC CIs for the resume bullets, since only the cosine-only CIs had
+  been transcribed into this file during Phase 8. Every AUC point value
+  reproduced exactly; only the CIs were new information.)
 
   **ROC A gets WORSE under gating, on both models — predicted in advance, and
   confirmed by investigation, not just observed.** Root cause: the `entities`
