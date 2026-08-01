@@ -1,0 +1,4 @@
+-r eval.txt
+pytest
+pytest-asyncio
+ruff

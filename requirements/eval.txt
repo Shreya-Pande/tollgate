@@ -1,0 +1,7 @@
+-r base.txt
+scikit-learn
+numpy
+pandas
+pyarrow
+matplotlib
+datasets

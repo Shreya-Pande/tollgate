@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+asyncpg
+pgvector
+pydantic
+pydantic-settings
+httpx
+fastembed
+python-dotenv
