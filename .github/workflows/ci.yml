@@ -48,9 +48,12 @@ jobs:
           set +e
           pytest -v --tb=long > /tmp/pytest_out.txt 2>&1
           code=$?
-          tail -n 80 /tmp/pytest_out.txt | while IFS= read -r line; do
-            echo "::error::${line}"
-          done
+          python -c "
+          text = open('/tmp/pytest_out.txt').read()
+          lines = text.splitlines()[-60:]
+          encoded = '\n'.join(lines).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f'::error::{encoded}')
+          "
           exit $code
 
   build:
