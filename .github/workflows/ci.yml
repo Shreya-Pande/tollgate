@@ -44,17 +44,7 @@ jobs:
         run: ruff check .
 
       - name: Test
-        run: |
-          set +e
-          pytest -v --tb=long > /tmp/pytest_out.txt 2>&1
-          code=$?
-          python -c "
-          text = open('/tmp/pytest_out.txt').read()
-          lines = text.splitlines()[-60:]
-          encoded = '\n'.join(lines).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-          print(f'::error::{encoded}')
-          "
-          exit $code
+        run: pytest -v
 
   build:
     runs-on: ubuntu-latest

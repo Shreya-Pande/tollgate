@@ -13,3 +13,16 @@ line-length = 100
 # oversight. Pinning explicitly also means the CI gate doesn't silently
 # get stricter on a ruff version bump.
 select = ["E4", "E7", "E9", "F"]
+
+[tool.pytest.ini_options]
+# DECISION-V2: without this, `app` is only importable when pytest is
+# invoked as `python -m pytest` (which adds cwd to sys.path) - the bare
+# `pytest` entry point does not, and CI's ci.yml uses the bare form.
+# Every local run in this project used `python -m pytest`, which silently
+# masked this for the whole time ci.yml existed: 5 real CI runs failed
+# with ModuleNotFoundError: No module named 'app' before this was caught
+# and root-caused. `pythonpath = ["."]` (pytest >=7) makes collection
+# work identically regardless of invocation style, instead of relying on
+# every future invocation (CI, a teammate's shell, an IDE's test runner)
+# happening to use `-m`.
+pythonpath = ["."]
